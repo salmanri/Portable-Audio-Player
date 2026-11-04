@@ -36,11 +36,11 @@ Designed to be **100% compatible** with both **ESP32 DOIT DevKit V1** and **ESP3
 | | `DC` | `GPIO 21` | Moved from GPIO 17 (PSRAM-safe) |
 | | `RES` (RST) | `GPIO 22` | Moved from GPIO 16 (PSRAM-safe) |
 | | `BUSY` | `GPIO 34` | Input-only pin (driven by SSD1680) |
-| **MicroSD Card (HSPI)** | `SCK` / `MOSI` / `MISO` / `CS` | `14` / `13` / `19` / `15` | Dedicated SPI bus (zero display contention) |
+| **MicroSD Card (VSPI)** | `SCK` / `MOSI` / `MISO` / `CS` | `18` / `23` / `19` / `15` | Shares hardware VSPI with separate `CS` |
 | **I2S Audio (`PCM5102A` + `MAX98357A`)** | `BCLK` / `LRCK` / `DOUT` | `26` / `25` / `27` | Shared digital I2S bus |
 | | `AMP_SD` | `GPIO 4` | `MAX98357A` Shutdown (`HIGH` = Speaker ON) |
 | **Rotary Encoder (`KY-040`)** | `CLK` / `DT` / `SW` | `35` / `39` / `32` | `KY-040` `+` pin must connect to `3V3` |
-| **Push Buttons** | `PREV` / `NEXT` / `MENU` | `33` / `12` / `2` | Active-LOW (`INPUT_PULLUP`) |
+| **Push Buttons** | `PREV` / `NEXT` / `MENU` | `33` / `14` / `13` | Active-LOW (`INPUT_PULLUP`) |
 | **Battery Monitor** | `BAT_ADC` | `GPIO 36` | Voltage divider (Phase 6) |
 
 ---

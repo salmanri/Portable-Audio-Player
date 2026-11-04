@@ -5,10 +5,9 @@
 #include "pins.h"
 #include "config.h"
 
-// Ubah ke 1 di Fase 2 saat modul KY-040 & 3 tombol fisik sudah dicolok ke ESP32.
-// Selama Fase 1 (pin 35 & 39 masih kosong/floating), biarkan 0 agar tidak muncul sinyal palsu.
+// Aktifkan pembacaan hardware Rotary Encoder KY-040 & 3 Push Button (Fase 2)
 #ifndef ENABLE_HARDWARE_INPUT
-#define ENABLE_HARDWARE_INPUT 0
+#define ENABLE_HARDWARE_INPUT 1
 #endif
 
 static volatile int32_t encDelta = 0;
@@ -113,10 +112,12 @@ InputEvent inputPoll()
   if (d >= 2) {
     encDelta -= 2;
     interrupts();
+    Serial.println("[Input] Knob Putar KANAN (CW)");
     return EVT_ENC_CW;
   } else if (d <= -2) {
     encDelta += 2;
     interrupts();
+    Serial.println("[Input] Knob Putar KIRI (CCW)");
     return EVT_ENC_CCW;
   }
   interrupts();
@@ -132,6 +133,7 @@ InputEvent inputPoll()
     if ((now - buttons[i].lastChangeMs) >= 35 && r != buttons[i].stableState) {
       buttons[i].stableState = r;
       if (r == LOW) { // Active LOW
+        Serial.printf("[Input] Tombol Ditekan (GPIO %u)\n", buttons[i].pin);
         return buttons[i].evt;
       }
     }

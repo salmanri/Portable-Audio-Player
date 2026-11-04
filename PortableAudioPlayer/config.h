@@ -2,7 +2,7 @@
 #pragma once
 
 #define FW_NAME     "Portable Audio Player"
-#define FW_VERSION  "v0.1 (Fase 1 - UI Simulasi)"
+#define FW_VERSION  "v0.2 (Fase 2 - Knob & Tombol)"
 
 // Volume (0..100)
 #define VOLUME_DEFAULT      50

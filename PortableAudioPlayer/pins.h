@@ -29,13 +29,12 @@
 #define EPD_BUSY   34  // -> BUSY (dulu GPIO 4 di SpotifyDesk)
 
 // ---------------------------------------------------------------------------
-// MicroSD — bus HSPI terpisah (dipakai mulai Fase 3)
-// Bus sendiri agar baca MP3 tidak pernah antre di belakang transfer e-paper.
+// MicroSD — berbagi bus VSPI dengan E-Paper (dipakai mulai Fase 3)
 // ---------------------------------------------------------------------------
-#define SD_SCK     14
-#define SD_MOSI    13
-#define SD_MISO    19
-#define SD_CS      15
+#define SD_SCK     18  // berbagi VSPI SCK
+#define SD_MOSI    23  // berbagi VSPI MOSI
+#define SD_MISO    19  // VSPI MISO
+#define SD_CS      15  // Chip Select khusus MicroSD
 
 // ---------------------------------------------------------------------------
 // Audio I2S -> PCM5102A (jack 3.5mm) & MAX98357A (speaker) paralel (Fase 4)
@@ -43,18 +42,18 @@
 #define I2S_BCLK   26
 #define I2S_LRCK   25
 #define I2S_DOUT   27
-#define AMP_SD      4  // pin SD MAX98357A: LOW = speaker mati
+#define AMP_SD      4  // pin SD MAX98357A: LOW = speaker mati, HIGH = speaker nyala
 
 // ---------------------------------------------------------------------------
-// Kontrol fisik (Fase 2)
+// Kontrol fisik (Fase 2) — Semua tombol memakai pin bebas dengan INPUT_PULLUP
 // ---------------------------------------------------------------------------
-#define ENC_CLK    35  // KY-040 CLK
-#define ENC_DT     39  // KY-040 DT  (label VN di board)
-#define ENC_SW     32  // KY-040 SW  (pakai pull-up internal)
+#define ENC_CLK    35  // KY-040 CLK (pull-up 10k bawaan modul KY-040)
+#define ENC_DT     39  // KY-040 DT  (label VN di board, pull-up 10k bawaan KY-040)
+#define ENC_SW     32  // KY-040 SW  (INPUT_PULLUP internal ESP32)
 
-#define BTN_PREV   33
-#define BTN_NEXT   12  // strapping pin: aman selama TIDAK diberi pull-up eksternal
-#define BTN_MENU    2  // strapping pin: dicek ulang saat board WROVER datang
+#define BTN_PREV   33  // Tombol [ << PREV ]      (INPUT_PULLUP, kaki lain ke GND)
+#define BTN_NEXT   14  // Tombol [ NEXT >> ]      (INPUT_PULLUP, kaki lain ke GND)
+#define BTN_MENU   13  // Tombol [ MENU / BACK ]  (INPUT_PULLUP, kaki lain ke GND)
 
 // ---------------------------------------------------------------------------
 // Baterai (Fase 6) — via pembagi tegangan 100k/100k
