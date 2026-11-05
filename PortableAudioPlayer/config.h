@@ -13,8 +13,8 @@
 #define FULL_REFRESH_AFTER_PARTIALS 120
 
 // Tunggu input "tenang" sebelum menggambar ulang, supaya putaran knob yang
-// cepat (misal scroll 5 baris) cukup digambar 1x di posisi akhir.
-#define INPUT_SETTLE_MS     90
+// cepat (misal scroll birkaç baris) cukup digambar 1x di posisi akhir.
+#define INPUT_SETTLE_MS     45
 
 // Geser timing lirik (ms). Positif = lirik muncul lebih awal.
 #define LYRIC_LEAD_MS       0

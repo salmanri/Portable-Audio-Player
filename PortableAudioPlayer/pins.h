@@ -1,4 +1,4 @@
-// pins.h — Pin map Portable Audio Player
+  // pins.h — Pin map Portable Audio Player
 //
 // Dirancang AMAN untuk dua board sekaligus (kode & kabel tidak perlu diubah
 // saat pindah board):

@@ -536,10 +536,11 @@ void displayDrawMenu(const char *headerTitle, const char *headerRight,
 
   setTextColors(GxEPD_BLACK, GxEPD_WHITE);
 
-  if (fullRefresh || ++partialCount >= FULL_REFRESH_AFTER_PARTIALS) {
+  if (fullRefresh) {
     epd.display(false);
     partialCount = 0;
   } else {
+    // Saat scroll di dalam menu, selalu gunakan Fast Partial Refresh agar tidak pernah kedip hitam
     epd.displayWindow(0, 0, SCREEN_W, SCREEN_H);
   }
 }

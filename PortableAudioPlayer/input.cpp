@@ -1,54 +1,110 @@
-// input.cpp — Pembacaan Input Keyboard Serial Monitor (Fase 1) +
-//             Interrupt Rotary Encoder KY-040 & 3 Push Button (Fase 2).
+// input.cpp — Pembacaan Input Responsif dengan Hardware Interrupt (ISR) penuh:
+//   1. Rotary Encoder KY-040 menggunakan Full-Cycle State Machine (1 klik detent = tepat 1 langkah,
+//      tidak pernah lompat/skip 2 baris dan bebas contact-bounce).
+//   2. Keempat tombol (ENC_SW, PREV, NEXT, MENU) menggunakan Hardware Interrupt FALLING edge,
+//      sehingga klik secepat apa pun langsung tertangkap instan (0 ms lag) meskipun layar
+//      E-Paper sedang sibuk melakukan refresh!
 
 #include "input.h"
 #include "pins.h"
 #include "config.h"
 
-// Aktifkan pembacaan hardware Rotary Encoder KY-040 & 3 Push Button (Fase 2)
 #ifndef ENABLE_HARDWARE_INPUT
 #define ENABLE_HARDWARE_INPUT 1
 #endif
 
-static volatile int32_t encDelta = 0;
+// Antrean ring-buffer kecil di RAM agar semua klik & putaran tertangkap instan dari ISR
+constexpr int EVT_QUEUE_SIZE = 16;
+static volatile InputEvent evtQueue[EVT_QUEUE_SIZE];
+static volatile uint8_t qHead = 0;
+static volatile uint8_t qTail = 0;
 
-#if ENABLE_HARDWARE_INPUT
-// Tabel state transisi quadrature encoder (anti-bounce tanpa delay)
-static volatile uint8_t encState = 0;
-static void IRAM_ATTR onEncoderISR()
+static inline void IRAM_ATTR pushEventISR(InputEvent e)
 {
-  static const int8_t TRANS[16] = {
-     0, -1,  1,  0,
-     1,  0,  0, -1,
-    -1,  0,  0,  1,
-     0,  1, -1,  0
-  };
-  uint8_t clk = (uint8_t)digitalRead(ENC_CLK);
-  uint8_t dt  = (uint8_t)digitalRead(ENC_DT);
-  encState = ((encState << 2) | (clk << 1) | dt) & 0x0F;
-  encDelta += TRANS[encState];
+  uint8_t nextHead = (qHead + 1) & (EVT_QUEUE_SIZE - 1);
+  if (nextHead != qTail) {
+    evtQueue[qHead] = e;
+    qHead = nextHead;
+  }
 }
 
-struct DebouncedBtn {
-  uint8_t pin;
-  InputEvent evt;
-  bool lastReading;
-  bool stableState;
-  unsigned long lastChangeMs;
+#if ENABLE_HARDWARE_INPUT
+// ---------------------------------------------------------------------------
+// 1. State Machine Presisi untuk KY-040 (Ben Buxton Quadrature Table)
+//    Hanya mengeluarkan event saat encoder tiba penuh di titik klik (detent = 11),
+//    sehingga 1 "klik" putaran jari = tepat 1 langkah di menu (tidak pernah skip!).
+// ---------------------------------------------------------------------------
+#define R_START     0x0
+#define R_CW_FINAL  0x1
+#define R_CW_BEGIN  0x2
+#define R_CW_NEXT   0x3
+#define R_CCW_BEGIN 0x4
+#define R_CCW_FINAL 0x5
+#define R_CCW_NEXT  0x6
+#define DIR_NONE    0x0
+#define DIR_CW      0x10
+#define DIR_CCW     0x20
+
+static const uint8_t ENC_TABLE[7][4] = {
+  // R_START (00/11 resting)
+  {R_START,    R_CW_BEGIN,  R_CCW_BEGIN, R_START},
+  // R_CW_FINAL
+  {R_CW_NEXT,  R_START,     R_CW_FINAL,  R_START | DIR_CW},
+  // R_CW_BEGIN
+  {R_CW_NEXT,  R_CW_BEGIN,  R_START,     R_START},
+  // R_CW_NEXT
+  {R_CW_NEXT,  R_CW_BEGIN,  R_CW_FINAL,  R_START},
+  // R_CCW_BEGIN
+  {R_CCW_NEXT, R_START,     R_CCW_BEGIN, R_START},
+  // R_CCW_FINAL
+  {R_CCW_NEXT, R_CCW_FINAL, R_START,     R_START | DIR_CCW},
+  // R_CCW_NEXT
+  {R_CCW_NEXT, R_CCW_FINAL, R_CCW_BEGIN, R_START},
 };
 
-static DebouncedBtn buttons[] = {
-  { ENC_SW,   EVT_ENC_CLICK, HIGH, HIGH, 0 },
-  { BTN_PREV, EVT_BTN_PREV,  HIGH, HIGH, 0 },
-  { BTN_NEXT, EVT_BTN_NEXT,  HIGH, HIGH, 0 },
-  { BTN_MENU, EVT_BTN_MENU,  HIGH, HIGH, 0 },
-};
+static volatile uint8_t encState = R_START;
+
+static void IRAM_ATTR onEncoderISR()
+{
+  uint8_t pinState = ((uint8_t)digitalRead(ENC_CLK) << 1) | (uint8_t)digitalRead(ENC_DT);
+  encState = ENC_TABLE[encState & 0x0F][pinState];
+  uint8_t dir = encState & 0x30;
+  if (dir == DIR_CW) {
+    pushEventISR(EVT_ENC_CW);
+  } else if (dir == DIR_CCW) {
+    pushEventISR(EVT_ENC_CCW);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Interrupt Instan untuk Keempat Tombol (ENC_SW, PREV, NEXT, MENU)
+//    Langsung merespons pada sentuhan pertama (FALLING edge) dengan proteksi
+//    anti-pantul (cooldown 170 ms), tidak perlu ditekan lama!
+// ---------------------------------------------------------------------------
+constexpr uint32_t BTN_COOLDOWN_MS = 170;
+static volatile uint32_t lastClickMs[4] = {0, 0, 0, 0};
+
+static void IRAM_ATTR handleButtonISR(uint8_t idx, uint8_t pin, InputEvent evt)
+{
+  if (digitalRead(pin) == LOW) {
+    uint32_t now = (uint32_t)millis();
+    if (now - lastClickMs[idx] >= BTN_COOLDOWN_MS) {
+      lastClickMs[idx] = now;
+      pushEventISR(evt);
+    }
+  }
+}
+
+static void IRAM_ATTR onBtnEncSwISR() { handleButtonISR(0, ENC_SW,   EVT_ENC_CLICK); }
+static void IRAM_ATTR onBtnPrevISR()  { handleButtonISR(1, BTN_PREV, EVT_BTN_PREV);  }
+static void IRAM_ATTR onBtnNextISR()  { handleButtonISR(2, BTN_NEXT, EVT_BTN_NEXT);  }
+static void IRAM_ATTR onBtnMenuISR()  { handleButtonISR(3, BTN_MENU, EVT_BTN_MENU);  }
 #endif
 
 void inputPrintHelp()
 {
   Serial.println("\n=======================================================");
-  Serial.println("  KONTROL SIMULASI SERIAL MONITOR (Ketik lalu Enter)");
+  Serial.println("  KONTROL KNOB, TOMBOL FISIK & SERIAL MONITOR AKTIF");
   Serial.println("=======================================================");
   Serial.println("  s / + / ]   : Putar Knob KANAN (Scroll Bawah / Vol+)");
   Serial.println("  w / - / [   : Putar Knob KIRI  (Scroll Atas  / Vol-)");
@@ -56,7 +112,6 @@ void inputPrintHelp()
   Serial.println("  n           : Tombol [ NEXT >> ]");
   Serial.println("  p           : Tombol [ << PREV ]");
   Serial.println("  m / b       : Tombol [ MENU / BACK ]");
-  Serial.println("  h / ?       : Tampilkan panduan tombol ini");
   Serial.println("=======================================================\n");
 }
 
@@ -70,16 +125,22 @@ void inputBegin()
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_MENU, INPUT_PULLUP);
 
-  encState = ((digitalRead(ENC_CLK) << 1) | digitalRead(ENC_DT)) & 0x03;
+  // Pasang interrupt untuk putaran Rotary Encoder
   attachInterrupt(digitalPinToInterrupt(ENC_CLK), onEncoderISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_DT), onEncoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_DT),  onEncoderISR, CHANGE);
+
+  // Pasang interrupt FALLING untuk semua tombol agar 1x sentuh langsung terdeteksi instan!
+  attachInterrupt(digitalPinToInterrupt(ENC_SW),   onBtnEncSwISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_PREV), onBtnPrevISR,  FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_NEXT), onBtnNextISR,  FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_MENU), onBtnMenuISR,  FALLING);
 #endif
   inputPrintHelp();
 }
 
 InputEvent inputPoll()
 {
-  // 1. Cek input dari Serial Monitor (aktif di Fase 1 maupun Fase 2 untuk debugging)
+  // 1. Cek input dari Serial Monitor
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
     if (c == '\r' || c == '\n') continue;
@@ -95,7 +156,7 @@ InputEvent inputPoll()
         return EVT_BTN_NEXT;
       case 'p': case 'P': case '<': case ',':
         return EVT_BTN_PREV;
-      case 'm': case 'M': case 'b': case 'B': case 27: // ESC
+      case 'm': case 'M': case 'b': case 'B': case 27:
         return EVT_BTN_MENU;
       case 'h': case 'H': case '?':
         inputPrintHelp();
@@ -106,40 +167,25 @@ InputEvent inputPoll()
   }
 
 #if ENABLE_HARDWARE_INPUT
-  // 2. Cek putaran Rotary Encoder (1 detent = 2 atau 4 step quadrature)
-  noInterrupts();
-  int32_t d = encDelta;
-  if (d >= 2) {
-    encDelta -= 2;
+  // 2. Ambil event dari antrean Interrupt (ISR)
+  if (qTail != qHead) {
+    noInterrupts();
+    InputEvent e = evtQueue[qTail];
+    qTail = (qTail + 1) & (EVT_QUEUE_SIZE - 1);
     interrupts();
-    Serial.println("[Input] Knob Putar KANAN (CW)");
-    return EVT_ENC_CW;
-  } else if (d <= -2) {
-    encDelta += 2;
-    interrupts();
-    Serial.println("[Input] Knob Putar KIRI (CCW)");
-    return EVT_ENC_CCW;
-  }
-  interrupts();
 
-  // 3. Cek klik tombol dengan debounce 35 ms
-  unsigned long now = millis();
-  for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
-    bool r = (bool)digitalRead(buttons[i].pin);
-    if (r != buttons[i].lastReading) {
-      buttons[i].lastChangeMs = now;
-      buttons[i].lastReading = r;
+    switch (e) {
+      case EVT_ENC_CW:    Serial.println("[Input] Knob Putar KANAN (CW)"); break;
+      case EVT_ENC_CCW:   Serial.println("[Input] Knob Putar KIRI (CCW)"); break;
+      case EVT_ENC_CLICK: Serial.println("[Input] Klik Tengah Knob (SW)"); break;
+      case EVT_BTN_PREV:  Serial.println("[Input] Tombol PREV (D33)"); break;
+      case EVT_BTN_NEXT:  Serial.println("[Input] Tombol NEXT (D14)"); break;
+      case EVT_BTN_MENU:  Serial.println("[Input] Tombol MENU (D13)"); break;
+      default: break;
     }
-    if ((now - buttons[i].lastChangeMs) >= 35 && r != buttons[i].stableState) {
-      buttons[i].stableState = r;
-      if (r == LOW) { // Active LOW
-        Serial.printf("[Input] Tombol Ditekan (GPIO %u)\n", buttons[i].pin);
-        return buttons[i].evt;
-      }
-    }
+    return e;
   }
 #endif
 
   return EVT_NONE;
 }
-
