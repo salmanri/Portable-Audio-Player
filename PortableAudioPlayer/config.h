@@ -1,12 +1,16 @@
 // config.h — Pengaturan umum Portable Audio Player
 #pragma once
 
-#define FW_NAME     "Portable Audio Player"
-#define FW_VERSION  "v0.2 (Fase 2 - Knob & Tombol)"
+#define FW_NAME        "Portable Audio Player"
+#define FW_VERSION     "0.3.0"
+
+// Identitas perangkat yang tampil di layar splash & About (boleh diganti sesuka hati)
+#define DEVICE_MODEL   "PA-01"
+#define DEVICE_TAGLINE "PORTABLE AUDIO PLAYER"
 
 // Volume (0..100)
 #define VOLUME_DEFAULT      50
-#define VOLUME_STEP         5
+#define VOLUME_STEP         1
 #define VOLUME_OVERLAY_MS   1500   // lama bar volume tampil setelah knob diputar
 
 // E-paper: full refresh berkala untuk membersihkan ghosting

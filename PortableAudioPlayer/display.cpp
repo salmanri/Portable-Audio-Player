@@ -1,5 +1,10 @@
-// display.cpp — Driver E-Paper WeAct 2.9" SSD1680 + UI Now Playing & Library Menu
-// Diadaptasi dari SpotifyDesk V2 & referensi MusicStation v2 oleh Roman Likhachev.
+// display.cpp — Desain UI E-Paper bergaya perangkat pabrikan / Walkman retro
+//
+// Prinsip desain:
+//   - Margin & grid konsisten, garis rambut 1px, tanpa kotak/bingkai berlebihan
+//   - Ikon vektor 12x12 digambar dengan primitif (tajam di layar 1-bit)
+//   - Tipografi Helvetica: Bold untuk judul, Regular untuk info sekunder
+//   - Selection bar membulat + scrollbar tipis pada daftar
 
 #include "display.h"
 #include "pins.h"
@@ -9,26 +14,292 @@
 #include <GxEPD2_BW.h>
 #include <U8g2_for_Adafruit_GFX.h>
 
-// WeAct 2.9" B/W = panel DEPG0290BS, controller SSD1680 (296x128).
+// WeAct 2.9" B/W = panel DEPG0290BS, controller SSD1680.
 GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> epd(
     GxEPD2_290_BS(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
 U8G2_FOR_ADAFRUIT_GFX u8g2;
 
-// Font proporsional Helvetica
-static const uint8_t *const TITLE_FONT    = u8g2_font_helvB14_tf;
-static const uint8_t *const ARTIST_FONT   = u8g2_font_helvR08_tf;
-static const uint8_t *const SUBTITLE_FONT = u8g2_font_helvB08_tf;
-static const uint8_t *const LYRIC_FONT    = u8g2_font_helvB12_tf;
-static const uint8_t *const TIME_FONT     = u8g2_font_helvB08_tf;
-static const uint8_t *const MENU_FONT     = u8g2_font_helvB10_tf;
-static const uint8_t *const MENU_SUB_FONT = u8g2_font_helvR08_tf;
+// ---------------------------------------------------------------------------
+// Font
+// ---------------------------------------------------------------------------
+static const uint8_t *const F_STATUS   = u8g2_font_helvB08_tf;
+static const uint8_t *const F_SMALL    = u8g2_font_helvR08_tf;
+static const uint8_t *const F_TITLE    = u8g2_font_helvB12_tf;
+static const uint8_t *const F_LYRIC_L  = u8g2_font_helvB12_tf;
+static const uint8_t *const F_LYRIC_S  = u8g2_font_helvB10_tf;
+static const uint8_t *const F_ROW      = u8g2_font_helvR10_tf;
+static const uint8_t *const F_ROW_SEL  = u8g2_font_helvB10_tf;
+static const uint8_t *const F_BIG      = u8g2_font_helvB18_tf;
+static const uint8_t *const F_HERO     = u8g2_font_helvB24_tf;
+
+// ---------------------------------------------------------------------------
+// Grid layout
+// ---------------------------------------------------------------------------
+constexpr int STATUS_LINE_Y = 14;   // garis rambut di bawah status bar
+
+constexpr int COVER_X  = 4;
+constexpr int COVER_Y  = 23;
+
+constexpr int COL_X = 110;          // kolom kanan
+constexpr int COL_W = 182;          // 110 + 182 = 292 (margin kanan 4px)
+
+constexpr int TITLE_BASE = 34;
+constexpr int SUB_BASE   = 47;
+constexpr int SEP_Y      = 53;
+
+constexpr int LYR_Y = 55;
+constexpr int LYR_H = 46;           // 55..100
+
+constexpr int TR_Y  = 102;
+constexpr int TR_H  = 26;           // 102..127
+
+constexpr int LIST_Y = 15;
+constexpr int ROW_H  = 18;
+constexpr int ROWS   = 6;
 
 static uint16_t partialCount = 0;
 
 // ---------------------------------------------------------------------------
-// Simbol Not Balok Musik 32x32 px (tampil saat jeda instrumental)
+// Helper teks
 // ---------------------------------------------------------------------------
-static const uint8_t MUSIC_NOTE_32x32[] = {
+static void textColor(uint16_t fg, uint16_t bg)
+{
+  u8g2.setForegroundColor(fg);
+  u8g2.setBackgroundColor(bg);
+}
+
+static int textWidth(const char *t, const uint8_t *font)
+{
+  if (!t || !t[0]) return 0;
+  u8g2.setFont(font);
+  return u8g2.getUTF8Width(t);
+}
+
+// Potong teks dengan "..." agar muat dalam maxW piksel
+static void fitText(const char *in, char *out, size_t outLen, int maxW, const uint8_t *font)
+{
+  u8g2.setFont(font);
+  strlcpy(out, in ? in : "", outLen);
+  if (u8g2.getUTF8Width(out) <= maxW) return;
+  int len = strlen(out);
+  while (len > 0) {
+    len--;
+    // jangan memotong di tengah karakter UTF-8 multi-byte
+    while (len > 0 && ((uint8_t)out[len] & 0xC0) == 0x80) len--;
+    out[len] = '\0';
+    char tmp[160];
+    snprintf(tmp, sizeof(tmp), "%s...", out);
+    if (u8g2.getUTF8Width(tmp) <= maxW) {
+      strlcpy(out, tmp, outLen);
+      return;
+    }
+  }
+  strlcpy(out, "...", outLen);
+}
+
+static void drawLeft(int x, int base, const char *t, const uint8_t *font, int maxW = 0)
+{
+  if (!t || !t[0]) return;
+  char buf[160];
+  if (maxW > 0) fitText(t, buf, sizeof(buf), maxW, font);
+  else strlcpy(buf, t, sizeof(buf));
+  u8g2.setFont(font);
+  u8g2.setCursor(x, base);
+  u8g2.print(buf);
+}
+
+static void drawRight(int rightX, int base, const char *t, const uint8_t *font, int maxW = 0)
+{
+  if (!t || !t[0]) return;
+  char buf[160];
+  if (maxW > 0) fitText(t, buf, sizeof(buf), maxW, font);
+  else strlcpy(buf, t, sizeof(buf));
+  u8g2.setFont(font);
+  u8g2.setCursor(rightX - u8g2.getUTF8Width(buf), base);
+  u8g2.print(buf);
+}
+
+static void drawCenter(int cx, int base, const char *t, const uint8_t *font, int maxW = 0)
+{
+  if (!t || !t[0]) return;
+  char buf[160];
+  if (maxW > 0) fitText(t, buf, sizeof(buf), maxW, font);
+  else strlcpy(buf, t, sizeof(buf));
+  u8g2.setFont(font);
+  u8g2.setCursor(cx - u8g2.getUTF8Width(buf) / 2, base);
+  u8g2.print(buf);
+}
+
+// Teks ASCII dengan jarak antar huruf (letter-spacing) — kesan label hardware
+static void drawSpacedCenter(int cx, int base, const char *t, const uint8_t *font, int spacing)
+{
+  u8g2.setFont(font);
+  char ch[2] = {0, 0};
+  int total = 0;
+  for (const char *p = t; *p; p++) {
+    ch[0] = *p;
+    total += u8g2.getUTF8Width(ch) + spacing;
+  }
+  total -= spacing;
+  int x = cx - total / 2;
+  for (const char *p = t; *p; p++) {
+    ch[0] = *p;
+    u8g2.setCursor(x, base);
+    u8g2.print(ch);
+    x += u8g2.getUTF8Width(ch) + spacing;
+  }
+}
+
+static void formatTime(uint32_t s, char *out, size_t n)
+{
+  snprintf(out, n, "%lu:%02lu", (unsigned long)(s / 60), (unsigned long)(s % 60));
+}
+
+static void dottedHLine(int x, int y, int w, uint16_t c)
+{
+  for (int i = 0; i < w; i += 3) epd.drawPixel(x + i, y, c);
+}
+
+// ---------------------------------------------------------------------------
+// Ikon vektor 12x12 (x,y = pojok kiri atas)
+// ---------------------------------------------------------------------------
+static void drawIcon(UiIcon icon, int x, int y, uint16_t c)
+{
+  switch (icon) {
+    case ICON_NOTE:
+      epd.fillCircle(x + 3, y + 9, 2, c);
+      epd.fillCircle(x + 9, y + 8, 2, c);
+      epd.drawFastVLine(x + 5, y + 1, 9, c);
+      epd.drawFastVLine(x + 11, y + 0, 9, c);
+      epd.fillRect(x + 5, y + 0, 7, 2, c);
+      break;
+
+    case ICON_LIST:
+      for (int i = 0; i < 3; i++) {
+        epd.fillRect(x + 0, y + 2 + i * 4, 2, 2, c);
+        epd.fillRect(x + 4, y + 2 + i * 4, 8, 2, c);
+      }
+      break;
+
+    case ICON_ARTIST:
+      epd.fillCircle(x + 6, y + 3, 3, c);
+      epd.fillRoundRect(x + 1, y + 8, 11, 4, 2, c);
+      break;
+
+    case ICON_ALBUM:
+      epd.drawCircle(x + 6, y + 6, 5, c);
+      epd.drawCircle(x + 6, y + 6, 4, c);
+      epd.fillCircle(x + 6, y + 6, 1, c);
+      break;
+
+    case ICON_HEADPHONES:
+      epd.drawCircleHelper(x + 6, y + 7, 5, 0x1 | 0x2, c);
+      epd.drawCircleHelper(x + 6, y + 7, 4, 0x1 | 0x2, c);
+      epd.fillRoundRect(x + 0, y + 6, 3, 6, 1, c);
+      epd.fillRoundRect(x + 9, y + 6, 3, 6, 1, c);
+      break;
+
+    case ICON_SPEAKER:
+      epd.fillRect(x + 0, y + 4, 3, 4, c);
+      epd.fillTriangle(x + 2, y + 6, x + 6, y + 1, x + 6, y + 11, c);
+      epd.drawCircleHelper(x + 6, y + 6, 3, 0x2 | 0x4, c);
+      epd.drawCircleHelper(x + 6, y + 6, 5, 0x2 | 0x4, c);
+      break;
+
+    case ICON_BLUETOOTH:
+      epd.drawFastVLine(x + 6, y + 0, 12, c);
+      epd.drawLine(x + 6, y + 0, x + 9, y + 3, c);
+      epd.drawLine(x + 9, y + 3, x + 3, y + 8, c);
+      epd.drawLine(x + 6, y + 11, x + 9, y + 8, c);
+      epd.drawLine(x + 9, y + 8, x + 3, y + 3, c);
+      break;
+
+    case ICON_REPEAT:
+    case ICON_REPEAT_ONE:
+      epd.drawRoundRect(x + 0, y + 3, 11, 7, 3, c);
+      epd.fillTriangle(x + 6, y + 1, x + 9, y + 3, x + 6, y + 5, c);
+      epd.fillTriangle(x + 5, y + 7, x + 2, y + 9, x + 5, y + 11, c);
+      if (icon == ICON_REPEAT_ONE) epd.drawFastVLine(x + 5, y + 5, 3, c);
+      break;
+
+    case ICON_SHUFFLE:
+      epd.drawLine(x + 0, y + 2, x + 3, y + 2, c);
+      epd.drawLine(x + 3, y + 2, x + 7, y + 9, c);
+      epd.drawLine(x + 7, y + 9, x + 9, y + 9, c);
+      epd.drawLine(x + 0, y + 9, x + 3, y + 9, c);
+      epd.drawLine(x + 3, y + 9, x + 7, y + 2, c);
+      epd.drawLine(x + 7, y + 2, x + 9, y + 2, c);
+      epd.fillTriangle(x + 9, y + 0, x + 11, y + 2, x + 9, y + 4, c);
+      epd.fillTriangle(x + 9, y + 7, x + 11, y + 9, x + 9, y + 11, c);
+      break;
+
+    case ICON_INFO:
+      epd.drawCircle(x + 6, y + 6, 5, c);
+      epd.fillRect(x + 5, y + 5, 2, 4, c);
+      epd.fillRect(x + 5, y + 3, 2, 1, c);
+      break;
+
+    case ICON_PLAY:
+      epd.fillTriangle(x + 3, y + 1, x + 3, y + 11, x + 10, y + 6, c);
+      break;
+
+    case ICON_PAUSE:
+      epd.fillRect(x + 2, y + 1, 3, 10, c);
+      epd.fillRect(x + 7, y + 1, 3, 10, c);
+      break;
+
+    default:
+      break;
+  }
+}
+
+// Baterai 17x8. pct < 0 -> ikon petir (ditenagai USB)
+static void drawBattery(int x, int y, int pct, uint16_t c)
+{
+  epd.drawRect(x, y, 15, 9, c);
+  epd.fillRect(x + 15, y + 3, 2, 3, c);
+  if (pct >= 0) {
+    int w = (11 * constrain(pct, 0, 100) + 50) / 100;
+    if (w > 0) epd.fillRect(x + 2, y + 2, w, 5, c);
+  } else {
+    epd.drawLine(x + 8, y + 1, x + 5, y + 4, c);
+    epd.drawFastHLine(x + 5, y + 4, 5, c);
+    epd.drawLine(x + 9, y + 4, x + 6, y + 7, c);
+  }
+}
+
+static void drawChevron(int x, int y, uint16_t c)
+{
+  // ">" tebal 2px, tinggi 7px
+  for (int k = 0; k < 2; k++) {
+    epd.drawLine(x + k, y, x + 3 + k, y + 3, c);
+    epd.drawLine(x + 3 + k, y + 3, x + k, y + 6, c);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Status bar (semua layar)
+// ---------------------------------------------------------------------------
+static void drawStatusBar(const char *title, const StatusInfo &st)
+{
+  epd.fillRect(0, 0, SCREEN_W, STATUS_LINE_Y + 1, GxEPD_WHITE);
+  textColor(GxEPD_BLACK, GxEPD_WHITE);
+  drawLeft(4, 11, title, F_STATUS, 215);
+
+  int x = SCREEN_W - 4 - 17;
+  drawBattery(x, 2, st.batteryPct, GxEPD_BLACK);
+  x -= 18;
+  drawIcon(st.outputIcon, x, 1, GxEPD_BLACK);
+  x -= 17;
+  drawIcon(st.modeIcon, x, 1, GxEPD_BLACK);
+
+  epd.drawFastHLine(0, STATUS_LINE_Y, SCREEN_W, GxEPD_BLACK);
+}
+
+// ---------------------------------------------------------------------------
+// Bagian layar Now Playing
+// ---------------------------------------------------------------------------
+static const uint8_t NOTE_32[] = {
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x01, 0xF0,
   0x00, 0x00, 0x1F, 0xF0, 0x00, 0x01, 0xFF, 0xF0,
@@ -47,290 +318,144 @@ static const uint8_t MUSIC_NOTE_32x32[] = {
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-static void drawMusicIcon(int cx, int cy)
+static void drawCover(const uint8_t *cover)
 {
-  epd.drawBitmap(cx - 16, cy - 16, MUSIC_NOTE_32x32, 32, 32, GxEPD_BLACK, GxEPD_WHITE);
-}
-
-// ---------------------------------------------------------------------------
-// Helper Gambar Teks
-// ---------------------------------------------------------------------------
-static void setTextColors(uint16_t fg, uint16_t bg)
-{
-  u8g2.setForegroundColor(fg);
-  u8g2.setBackgroundColor(bg);
-}
-
-static void drawText(int x, int baselineY, const char *text, const uint8_t *font)
-{
-  if (!text || !text[0]) return;
-  u8g2.setFont(font);
-  u8g2.setCursor(x, baselineY);
-  u8g2.print(text);
-}
-
-static void drawTextRight(int rightX, int baselineY, const char *text, const uint8_t *font)
-{
-  if (!text || !text[0]) return;
-  u8g2.setFont(font);
-  int w = u8g2.getUTF8Width(text);
-  u8g2.setCursor(rightX - w, baselineY);
-  u8g2.print(text);
-}
-
-static void drawTextCenter(int centerX, int baselineY, const char *text, const uint8_t *font)
-{
-  if (!text || !text[0]) return;
-  u8g2.setFont(font);
-  int w = u8g2.getUTF8Width(text);
-  u8g2.setCursor(centerX - w / 2, baselineY);
-  u8g2.print(text);
-}
-
-static void drawTextFitted(int x, int baselineY, const char *text, int maxW, const uint8_t *font)
-{
-  if (!text || !text[0]) return;
-  u8g2.setFont(font);
-  int w = u8g2.getUTF8Width(text);
-  if (w <= maxW) {
-    u8g2.setCursor(x, baselineY);
-    u8g2.print(text);
-    return;
-  }
-  char buf[128];
-  strncpy(buf, text, sizeof(buf) - 4);
-  buf[sizeof(buf) - 4] = '\0';
-  int len = strlen(buf);
-  while (len > 0) {
-    buf[len] = '\0';
-    strcpy(buf + len, "...");
-    if (u8g2.getUTF8Width(buf) <= maxW) break;
-    len--;
-  }
-  u8g2.setCursor(x, baselineY);
-  u8g2.print(buf);
-}
-
-static void drawTextRightFitted(int rightX, int baselineY, const char *text, int maxW,
-                                const uint8_t *font)
-{
-  if (!text || !text[0]) return;
-  u8g2.setFont(font);
-  int w = u8g2.getUTF8Width(text);
-  if (w <= maxW) {
-    u8g2.setCursor(rightX - w, baselineY);
-    u8g2.print(text);
-    return;
-  }
-  char buf[128];
-  strncpy(buf, text, sizeof(buf) - 4);
-  buf[sizeof(buf) - 4] = '\0';
-  int len = strlen(buf);
-  while (len > 0) {
-    buf[len] = '\0';
-    strcpy(buf + len, "...");
-    if (u8g2.getUTF8Width(buf) <= maxW) break;
-    len--;
-  }
-  int fitW = u8g2.getUTF8Width(buf);
-  u8g2.setCursor(rightX - fitW, baselineY);
-  u8g2.print(buf);
-}
-
-static void formatTime(uint32_t seconds, char *out, size_t size)
-{
-  snprintf(out, size, "%lu:%02lu", (unsigned long)(seconds / 60),
-           (unsigned long)(seconds % 60));
-}
-
-// Gambar grafis kaset retro jika lagu belum punya bitmap cover art
-static void drawDefaultCassetteArt()
-{
-  epd.fillRect(COVER_X, COVER_Y, COVER_SIZE, COVER_SIZE, GxEPD_WHITE);
-  epd.drawRect(COVER_X, COVER_Y, COVER_SIZE, COVER_SIZE, GxEPD_BLACK);
-  epd.drawRect(COVER_X + 3, COVER_Y + 3, COVER_SIZE - 6, COVER_SIZE - 6, GxEPD_BLACK);
-
-  // Badan kaset di tengah
-  int cx = COVER_X + 8;
-  int cy = COVER_Y + 18;
-  int cw = COVER_SIZE - 16; // 80
-  int ch = 56;
-  epd.drawRoundRect(cx, cy, cw, ch, 4, GxEPD_BLACK);
-  epd.drawRect(cx + 6, cy + 6, cw - 12, 28, GxEPD_BLACK);
-
-  // Dua roda pita kaset
-  int r1x = cx + 22, r2x = cx + cw - 22, ry = cy + 20;
-  epd.drawCircle(r1x, ry, 9, GxEPD_BLACK);
-  epd.drawCircle(r1x, ry, 4, GxEPD_BLACK);
-  epd.drawCircle(r2x, ry, 9, GxEPD_BLACK);
-  epd.drawCircle(r2x, ry, 4, GxEPD_BLACK);
-  epd.drawRect(r1x + 10, ry - 4, r2x - r1x - 20, 8, GxEPD_BLACK);
-
-  // Trapesium bawah kaset
-  epd.drawLine(cx + 12, cy + ch, cx + 18, cy + ch - 12, GxEPD_BLACK);
-  epd.drawLine(cx + cw - 12, cy + ch, cx + cw - 18, cy + ch - 12, GxEPD_BLACK);
-  epd.drawFastHLine(cx + 18, cy + ch - 12, cw - 36, GxEPD_BLACK);
-
-  setTextColors(GxEPD_BLACK, GxEPD_WHITE);
-  drawTextCenter(COVER_X + COVER_SIZE / 2, COVER_Y + 14, "WALKMAN DAP", ARTIST_FONT);
-  drawTextCenter(COVER_X + COVER_SIZE / 2, COVER_Y + COVER_SIZE - 6, "HI-FI AUDIO", ARTIST_FONT);
-}
-
-static void drawPlayPauseIcon(int cx, int cy, bool playing)
-{
-  if (playing) {
-    epd.fillRect(cx - 5, cy - 5, 3, 10, GxEPD_BLACK);
-    epd.fillRect(cx + 2, cy - 5, 3, 10, GxEPD_BLACK);
+  epd.fillRect(COVER_X - 1, COVER_Y - 1, COVER_SIZE + 2, COVER_SIZE + 2, GxEPD_WHITE);
+  if (cover) {
+    epd.drawBitmap(COVER_X, COVER_Y, cover, COVER_SIZE, COVER_SIZE, GxEPD_BLACK, GxEPD_WHITE);
   } else {
-    epd.fillTriangle(cx - 4, cy - 5, cx - 4, cy + 5, cx + 5, cy, GxEPD_BLACK);
+    epd.drawBitmap(COVER_X + 32, COVER_Y + 24, NOTE_32, 32, 32, GxEPD_BLACK, GxEPD_WHITE);
+    textColor(GxEPD_BLACK, GxEPD_WHITE);
+    drawCenter(COVER_X + COVER_SIZE / 2, COVER_Y + 74, "No Artwork", F_SMALL);
   }
+  epd.drawRect(COVER_X - 1, COVER_Y - 1, COVER_SIZE + 2, COVER_SIZE + 2, GxEPD_BLACK);
 }
 
-// ---------------------------------------------------------------------------
-// Header Now Playing: Judul Lagu (Baris 1) & Artis + Badge Output/Album (Baris 2)
-// ---------------------------------------------------------------------------
-static void drawHeader(const char *title, const char *artist, const char *badgeRight)
+static void drawTrackHeader(const TrackView &t)
 {
-  setTextColors(GxEPD_BLACK, GxEPD_WHITE);
-  if (title && title[0]) {
-    drawTextFitted(4, 15, title, SCREEN_W - 8, TITLE_FONT);
-  }
+  epd.fillRect(COL_X, STATUS_LINE_Y + 1, COL_W, LYR_Y - STATUS_LINE_Y - 1, GxEPD_WHITE);
+  textColor(GxEPD_BLACK, GxEPD_WHITE);
+  drawLeft(COL_X, TITLE_BASE, t.title, F_TITLE, COL_W);
 
-  const bool hasArtist = (artist && artist[0]);
-  const bool hasRight  = (badgeRight && badgeRight[0]);
+  char sub[200];
+  const bool hasArtist = t.artist && t.artist[0];
+  const bool hasAlbum  = t.album && t.album[0];
+  if (hasArtist && hasAlbum) snprintf(sub, sizeof(sub), "%s  \xC2\xB7  %s", t.artist, t.album);
+  else snprintf(sub, sizeof(sub), "%s", hasArtist ? t.artist : (hasAlbum ? t.album : ""));
+  drawLeft(COL_X, SUB_BASE, sub, F_SMALL, COL_W);
 
-  if (hasArtist && hasRight) {
-    u8g2.setFont(SUBTITLE_FONT);
-    int wRight = u8g2.getUTF8Width(badgeRight);
-    int maxArtW = SCREEN_W - 8 - wRight - 10;
-    if (maxArtW < 80) maxArtW = 80;
-
-    drawTextFitted(4, 28, artist, maxArtW, ARTIST_FONT);
-    drawTextRightFitted(SCREEN_W - 4, 28, badgeRight, SCREEN_W - 8 - maxArtW, SUBTITLE_FONT);
-  } else if (hasArtist) {
-    drawTextFitted(4, 28, artist, SCREEN_W - 8, ARTIST_FONT);
-  } else if (hasRight) {
-    drawTextRightFitted(SCREEN_W - 4, 28, badgeRight, SCREEN_W - 8, SUBTITLE_FONT);
-  }
-
-  epd.drawFastHLine(0, 31, SCREEN_W, GxEPD_BLACK);
+  dottedHLine(COL_X, SEP_Y, COL_W, GxEPD_BLACK);
 }
 
-// ---------------------------------------------------------------------------
-// Area Transport: Waktu & Progress Bar
-// ---------------------------------------------------------------------------
-static void drawTransport(uint32_t elapsedSec, uint32_t durationSec, bool playing)
+static void drawTransport(const TrackView &t)
 {
-  epd.fillRect(RIGHT_X, TRANSPORT_Y, RIGHT_W, TRANSPORT_H, GxEPD_WHITE);
-  setTextColors(GxEPD_BLACK, GxEPD_WHITE);
+  epd.fillRect(COL_X, TR_Y, COL_W, TR_H, GxEPD_WHITE);
 
-  char elapsedText[12];
-  char durationText[12];
-  formatTime(elapsedSec, elapsedText, sizeof(elapsedText));
-  formatTime(durationSec, durationText, sizeof(durationText));
+  // Progress bar: garis rambut + isi 3px + kenop bulat
+  const int barY = TR_Y + 5;
+  epd.drawFastHLine(COL_X, barY, COL_W, GxEPD_BLACK);
+  int fill = 0;
+  if (t.durationSec > 0) {
+    fill = (int)((uint64_t)COL_W * min(t.elapsedSec, t.durationSec) / t.durationSec);
+  }
+  if (fill > 0) epd.fillRect(COL_X, barY - 1, fill, 3, GxEPD_BLACK);
+  int knobX = constrain(COL_X + fill, COL_X + 3, COL_X + COL_W - 4);
+  epd.fillCircle(knobX, barY, 3, GxEPD_BLACK);
 
-  drawText(RIGHT_X + 4, TRANSPORT_Y + 11, elapsedText, TIME_FONT);
-  drawTextRight(RIGHT_X + RIGHT_W - 4, TRANSPORT_Y + 11, durationText, TIME_FONT);
-  drawPlayPauseIcon(RIGHT_X + RIGHT_W / 2, TRANSPORT_Y + 7, playing);
+  char a[12], b[12];
+  formatTime(t.elapsedSec, a, sizeof(a));
+  formatTime(t.durationSec, b, sizeof(b));
 
-  const int barX = RIGHT_X + 4;
-  const int barW = RIGHT_W - 8;
-  const int barY = TRANSPORT_Y + 16;
-  const int barH = 5;
+  textColor(GxEPD_BLACK, GxEPD_WHITE);
+  const int base = TR_Y + 20;
+  drawLeft(COL_X, base, a, F_SMALL);
+  drawRight(COL_X + COL_W, base, b, F_SMALL);
 
-  epd.drawRect(barX, barY, barW, barH, GxEPD_BLACK);
-  if (durationSec > 0) {
-    int fill = (int)((uint64_t)(barW - 2) * min(elapsedSec, durationSec) / durationSec);
-    if (fill > 0) {
-      epd.fillRect(barX + 1, barY + 1, fill, barH - 2, GxEPD_BLACK);
+  // Ikon tombol Play / Pause tepat di tengah bawah progress bar
+  // (saat lagu berjalan tampilkan "||", saat dijeda tampilkan "|>")
+  drawIcon(t.playing ? ICON_PAUSE : ICON_PLAY,
+           COL_X + COL_W / 2 - 6, TR_Y + 10, GxEPD_BLACK);
+}
+
+// Bungkus kata ke beberapa baris. Return jumlah baris, atau maxLines+1 jika tidak muat.
+static int wrapLines(const char *text, int maxW, char out[][72], int maxLines)
+{
+  char buf[160];
+  strlcpy(buf, text, sizeof(buf));
+  int n = 0;
+  char cur[72] = "";
+  for (char *w = strtok(buf, " "); w; w = strtok(nullptr, " ")) {
+    char test[160];
+    if (cur[0]) snprintf(test, sizeof(test), "%s %s", cur, w);
+    else strlcpy(test, w, sizeof(test));
+
+    if (!cur[0] || u8g2.getUTF8Width(test) <= maxW) {
+      strlcpy(cur, test, sizeof(cur));
+    } else {
+      if (n >= maxLines) return maxLines + 1;
+      strlcpy(out[n++], cur, 72);
+      strlcpy(cur, w, sizeof(cur));
     }
   }
+  if (cur[0]) {
+    if (n >= maxLines) return maxLines + 1;
+    strlcpy(out[n++], cur, 72);
+  }
+  return n;
 }
 
-// ---------------------------------------------------------------------------
-// Area Lirik: Auto-wrap & Center Aligned (atau simbol ♪ saat jeda)
-// ---------------------------------------------------------------------------
-static void drawLyrics(const char *text)
+static void drawLyrics(const char *text, bool hasLyrics)
 {
-  epd.fillRect(RIGHT_X, LYRIC_AREA_Y, RIGHT_W, LYRIC_AREA_H, GxEPD_WHITE);
+  epd.fillRect(COL_X, LYR_Y, COL_W, LYR_H, GxEPD_WHITE);
+  textColor(GxEPD_BLACK, GxEPD_WHITE);
+  const int cx = COL_X + COL_W / 2;
+  const int cy = LYR_Y + LYR_H / 2;
 
-  const int centerX = RIGHT_X + (RIGHT_W / 2);
-  const int centerY = LYRIC_AREA_Y + (LYRIC_AREA_H / 2);
-
+  if (!hasLyrics) {
+    drawCenter(cx, cy + 4, "No lyrics available", F_SMALL);
+    return;
+  }
   if (!text || !text[0]) {
-    drawMusicIcon(centerX, centerY);
+    // Jeda instrumental: tiga titik tenang
+    epd.fillCircle(cx - 12, cy, 2, GxEPD_BLACK);
+    epd.fillCircle(cx,      cy, 2, GxEPD_BLACK);
+    epd.fillCircle(cx + 12, cy, 2, GxEPD_BLACK);
     return;
   }
 
-  u8g2.setFont(LYRIC_FONT);
-  setTextColors(GxEPD_BLACK, GxEPD_WHITE);
+  const int maxW = COL_W - 6;
+  char lines[3][72];
+  const uint8_t *font = F_LYRIC_L;
+  int asc = 12, lh = 18;
 
-  const int maxW = RIGHT_W - 16;
-  char lines[4][64];
-  int lineCount = 0;
-  lines[0][0] = '\0';
-
-  char textCopy[256];
-  strncpy(textCopy, text, sizeof(textCopy) - 1);
-  textCopy[sizeof(textCopy) - 1] = '\0';
-
-  char *word = strtok(textCopy, " ");
-  char currentLine[64] = "";
-
-  while (word && lineCount < 4) {
-    char testLine[64];
-    if (currentLine[0] == '\0') {
-      strncpy(testLine, word, sizeof(testLine) - 1);
-      testLine[sizeof(testLine) - 1] = '\0';
-    } else {
-      snprintf(testLine, sizeof(testLine), "%s %s", currentLine, word);
-    }
-
-    if (u8g2.getUTF8Width(testLine) <= maxW) {
-      strncpy(currentLine, testLine, sizeof(currentLine) - 1);
-      currentLine[sizeof(currentLine) - 1] = '\0';
-      word = strtok(nullptr, " ");
-    } else {
-      if (currentLine[0] != '\0') {
-        strncpy(lines[lineCount++], currentLine, sizeof(lines[0]) - 1);
-        lines[lineCount - 1][sizeof(lines[0]) - 1] = '\0';
-        currentLine[0] = '\0';
-      } else {
-        strncpy(lines[lineCount++], word, sizeof(lines[0]) - 1);
-        lines[lineCount - 1][sizeof(lines[0]) - 1] = '\0';
-        word = strtok(nullptr, " ");
-      }
+  u8g2.setFont(F_LYRIC_L);
+  int n = wrapLines(text, maxW, lines, 2);
+  if (n > 2) {
+    font = F_LYRIC_S;
+    asc = 10;
+    lh = 15;
+    u8g2.setFont(font);
+    n = wrapLines(text, maxW, lines, 3);
+    if (n > 3) {
+      n = 3;
+      strlcat(lines[2], " ...", sizeof(lines[2]));
     }
   }
 
-  if (currentLine[0] != '\0' && lineCount < 4) {
-    strncpy(lines[lineCount++], currentLine, sizeof(lines[0]) - 1);
-    lines[lineCount - 1][sizeof(lines[0]) - 1] = '\0';
+  const int block = asc + (n - 1) * lh;
+  const int top = LYR_Y + (LYR_H - block) / 2;
+  for (int i = 0; i < n; i++) {
+    drawCenter(cx, top + asc + i * lh, lines[i], font, maxW);
   }
+}
 
-  int baseHeights[4];
-  if (lineCount == 1) {
-    baseHeights[0] = LYRIC_AREA_Y + 41;
-  } else if (lineCount == 2) {
-    baseHeights[0] = LYRIC_AREA_Y + 31;
-    baseHeights[1] = LYRIC_AREA_Y + 54;
-  } else if (lineCount == 3) {
-    baseHeights[0] = LYRIC_AREA_Y + 22;
-    baseHeights[1] = LYRIC_AREA_Y + 42;
-    baseHeights[2] = LYRIC_AREA_Y + 63;
+static void refreshWindow(int x, int y, int w, int h)
+{
+  if (++partialCount >= FULL_REFRESH_AFTER_PARTIALS) {
+    epd.display(false);   // full refresh berkala untuk membersihkan ghosting
+    partialCount = 0;
   } else {
-    baseHeights[0] = LYRIC_AREA_Y + 16;
-    baseHeights[1] = LYRIC_AREA_Y + 33;
-    baseHeights[2] = LYRIC_AREA_Y + 50;
-    baseHeights[3] = LYRIC_AREA_Y + 67;
-  }
-
-  for (int i = 0; i < lineCount; i++) {
-    int w = u8g2.getUTF8Width(lines[i]);
-    int lineX = centerX - (w / 2);
-    if (lineX < RIGHT_X + 4) lineX = RIGHT_X + 4;
-    u8g2.setCursor(lineX, baseHeights[i]);
-    u8g2.print(lines[i]);
+    epd.displayWindow(x, y, w, h);
   }
 }
 
@@ -343,234 +468,162 @@ void displayBegin()
   epd.epd2.selectSPI(SPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
 
   epd.init(115200, true, 2, false);
-  epd.setRotation(1);  // Landscape 296x128
+  epd.setRotation(1);  // landscape 296x128
   epd.setTextWrap(false);
 
   u8g2.begin(epd);
   u8g2.setFontMode(1);
   u8g2.setFontDirection(0);
-  setTextColors(GxEPD_BLACK, GxEPD_WHITE);
+  textColor(GxEPD_BLACK, GxEPD_WHITE);
 }
 
-void displayDrawSplash()
+void displaySplash()
 {
   epd.setFullWindow();
   epd.fillScreen(GxEPD_WHITE);
+  textColor(GxEPD_BLACK, GxEPD_WHITE);
 
-  drawDefaultCassetteArt();
-  drawHeader("WALKMAN DAP", "Portable Audio Player", FW_VERSION);
-
-  setTextColors(GxEPD_BLACK, GxEPD_WHITE);
-  drawTextCenter(RIGHT_X + RIGHT_W / 2, 62, "RETRO E-INK PLAYER", MENU_FONT);
-  drawTextCenter(RIGHT_X + RIGHT_W / 2, 82, "3.5mm + Speaker + BT", ARTIST_FONT);
-  drawTextCenter(RIGHT_X + RIGHT_W / 2, 112, "Memuat perpustakaan...", ARTIST_FONT);
+  const int cx = SCREEN_W / 2;
+  drawSpacedCenter(cx, 30, DEVICE_TAGLINE, F_STATUS, 3);
+  drawCenter(cx, 72, DEVICE_MODEL, F_HERO);
+  epd.drawFastHLine(cx - 60, 84, 120, GxEPD_BLACK);
+  drawCenter(cx, 100, "Hi-Fi Digital Audio  \xC2\xB7  E-Paper Display", F_SMALL);
+  drawCenter(cx, 121, "Firmware " FW_VERSION, F_SMALL);
 
   epd.display(false);
   partialCount = 0;
 }
 
-void displayDrawTrack(const char *title, const char *artist, const char *badgeRight,
-                      const uint8_t *coverBitmap,
-                      uint32_t elapsedSec, uint32_t durationSec, bool playing,
-                      const char *lyricText)
+void displayNowPlaying(const StatusInfo &st, const TrackView &t,
+                       const char *lyric, bool hasLyrics, bool fullRefresh)
 {
   epd.setFullWindow();
   epd.fillScreen(GxEPD_WHITE);
 
-  drawHeader(title, artist, badgeRight);
-
-  if (coverBitmap) {
-    epd.drawBitmap(COVER_X, COVER_Y, coverBitmap, COVER_SIZE, COVER_SIZE,
-                   GxEPD_BLACK, GxEPD_WHITE);
-    epd.drawRect(COVER_X, COVER_Y, COVER_SIZE, COVER_SIZE, GxEPD_BLACK);
-  } else {
-    drawDefaultCassetteArt();
-  }
-
-  drawLyrics(lyricText);
-  drawTransport(elapsedSec, durationSec, playing);
-
-  epd.display(false);
-  partialCount = 0;
-}
-
-void displayUpdateTransport(uint32_t elapsedSec, uint32_t durationSec, bool playing)
-{
-  drawTransport(elapsedSec, durationSec, playing);
-
-  if (++partialCount >= FULL_REFRESH_AFTER_PARTIALS) {
-    epd.display(false);
-    partialCount = 0;
-  } else {
-    epd.displayWindow(RIGHT_X, TRANSPORT_Y, RIGHT_W, TRANSPORT_H);
-  }
-}
-
-void displayUpdateLyrics(const char *lyricText)
-{
-  drawLyrics(lyricText);
-
-  if (++partialCount >= FULL_REFRESH_AFTER_PARTIALS) {
-    epd.display(false);
-    partialCount = 0;
-  } else {
-    epd.displayWindow(RIGHT_X, LYRIC_AREA_Y, RIGHT_W, LYRIC_AREA_H);
-  }
-}
-
-void displayUpdateLyricsAndTransport(const char *lyricText, uint32_t elapsedSec,
-                                     uint32_t durationSec, bool playing)
-{
-  drawLyrics(lyricText);
-  drawTransport(elapsedSec, durationSec, playing);
-
-  if (++partialCount >= FULL_REFRESH_AFTER_PARTIALS) {
-    epd.display(false);
-    partialCount = 0;
-  } else {
-    epd.displayWindow(RIGHT_X, LYRIC_AREA_Y, RIGHT_W, LYRIC_AREA_H + TRANSPORT_H);
-  }
-}
-
-void displayUpdateVolumePopup(int volumePercent, const char *outputName,
-                              uint32_t elapsedSec, uint32_t durationSec, bool playing)
-{
-  epd.fillRect(RIGHT_X, LYRIC_AREA_Y, RIGHT_W, LYRIC_AREA_H, GxEPD_WHITE);
-
-  // Kotak pop-up retro di tengah area lirik
-  const int boxX = RIGHT_X + 10;
-  const int boxY = LYRIC_AREA_Y + 8;
-  const int boxW = RIGHT_W - 20; // 172
-  const int boxH = LYRIC_AREA_H - 16; // 56
-
-  epd.drawRect(boxX, boxY, boxW, boxH, GxEPD_BLACK);
-  epd.drawRect(boxX + 2, boxY + 2, boxW - 4, boxH - 4, GxEPD_BLACK);
-
-  setTextColors(GxEPD_BLACK, GxEPD_WHITE);
-  char volTitle[40];
-  snprintf(volTitle, sizeof(volTitle), "VOLUME  %d%%", constrain(volumePercent, 0, 100));
-  drawTextCenter(RIGHT_X + RIGHT_W / 2, boxY + 20, volTitle, LYRIC_FONT);
-
-  if (outputName && outputName[0]) {
-    drawTextCenter(RIGHT_X + RIGHT_W / 2, boxY + 33, outputName, ARTIST_FONT);
-  }
-
-  // Bar volume bergaya segmen retro
-  const int barX = boxX + 12;
-  const int barY = boxY + 39;
-  const int barW = boxW - 24;
-  const int barH = 10;
-  epd.drawRect(barX, barY, barW, barH, GxEPD_BLACK);
-
-  int fillW = (barW - 4) * constrain(volumePercent, 0, 100) / 100;
-  if (fillW > 0) {
-    epd.fillRect(barX + 2, barY + 2, fillW, barH - 4, GxEPD_BLACK);
-  }
-
-  drawTransport(elapsedSec, durationSec, playing);
-  epd.displayWindow(RIGHT_X, LYRIC_AREA_Y, RIGHT_W, LYRIC_AREA_H + TRANSPORT_H);
-}
-
-// ---------------------------------------------------------------------------
-// Layar Menu / Library (Gaya MusicStation v2 — 6 baris dengan Inverted Bar)
-// ---------------------------------------------------------------------------
-void displayDrawMenu(const char *headerTitle, const char *headerRight,
-                     const char *const *items, const char *const *rightLabels,
-                     int itemCount, int selectedIndex, bool fullRefresh)
-{
-  if (fullRefresh) {
-    epd.setFullWindow();
-  }
-  epd.fillScreen(GxEPD_WHITE);
-
-  // Header Bar (Y = 0..19)
-  setTextColors(GxEPD_BLACK, GxEPD_WHITE);
-  drawTextFitted(6, 14, headerTitle ? headerTitle : "LIBRARY", 200, MENU_FONT);
-
-  char posBuf[32];
-  if (headerRight && headerRight[0]) {
-    snprintf(posBuf, sizeof(posBuf), "%s  %d/%d", headerRight,
-             itemCount > 0 ? (selectedIndex + 1) : 0, itemCount);
-  } else {
-    snprintf(posBuf, sizeof(posBuf), "%d/%d",
-             itemCount > 0 ? (selectedIndex + 1) : 0, itemCount);
-  }
-  drawTextRight(SCREEN_W - 6, 14, posBuf, TIME_FONT);
-  epd.drawFastHLine(0, MENU_HEADER_H - 1, SCREEN_W, GxEPD_BLACK);
-
-  // Hitung window scroll supaya selectedIndex selalu terlihat di antara 6 baris
-  int firstIdx = 0;
-  if (selectedIndex >= MENU_VISIBLE_ROWS) {
-    firstIdx = selectedIndex - (MENU_VISIBLE_ROWS - 1);
-  }
-  if (firstIdx + MENU_VISIBLE_ROWS > itemCount && itemCount > MENU_VISIBLE_ROWS) {
-    firstIdx = itemCount - MENU_VISIBLE_ROWS;
-  }
-  if (firstIdx < 0) firstIdx = 0;
-
-  for (int row = 0; row < MENU_VISIBLE_ROWS; row++) {
-    int idx = firstIdx + row;
-    if (idx >= itemCount) break;
-
-    int rowY = MENU_LIST_Y + row * MENU_ROW_H;
-    bool isSelected = (idx == selectedIndex);
-
-    if (isSelected) {
-      // Baris aktif: blok hitam pekat, teks putih (Inverted Selection Band)
-      epd.fillRect(0, rowY, SCREEN_W, MENU_ROW_H, GxEPD_BLACK);
-      setTextColors(GxEPD_WHITE, GxEPD_BLACK);
-    } else {
-      setTextColors(GxEPD_BLACK, GxEPD_WHITE);
-    }
-
-    int rightW = 0;
-    if (rightLabels && rightLabels[idx] && rightLabels[idx][0]) {
-      u8g2.setFont(MENU_SUB_FONT);
-      rightW = u8g2.getUTF8Width(rightLabels[idx]) + 10;
-      drawTextRight(SCREEN_W - 6, rowY + 13, rightLabels[idx], MENU_SUB_FONT);
-    }
-
-    int maxItemW = SCREEN_W - 16 - rightW;
-    drawTextFitted(8, rowY + 13, items[idx], maxItemW, MENU_FONT);
-  }
-
-  setTextColors(GxEPD_BLACK, GxEPD_WHITE);
+  drawStatusBar("Now Playing", st);
+  drawCover(t.cover);
+  drawTrackHeader(t);
+  drawLyrics(lyric, hasLyrics);
+  drawTransport(t);
 
   if (fullRefresh) {
     epd.display(false);
     partialCount = 0;
   } else {
-    // Saat scroll di dalam menu, selalu gunakan Fast Partial Refresh agar tidak pernah kedip hitam
-    epd.displayWindow(0, 0, SCREEN_W, SCREEN_H);
+    refreshWindow(0, 0, SCREEN_W, SCREEN_H);
   }
 }
 
-void displayDrawAbout(const char *outputName, const char *playModeName, int volumePercent)
+void displayUpdateTransport(const TrackView &t)
+{
+  drawTransport(t);
+  refreshWindow(COL_X, TR_Y, COL_W, TR_H);
+}
+
+void displayUpdateLyrics(const TrackView &t, const char *lyric, bool hasLyrics)
+{
+  drawLyrics(lyric, hasLyrics);
+  drawTransport(t);
+  refreshWindow(COL_X, LYR_Y, COL_W, TR_Y + TR_H - LYR_Y);
+}
+
+void displayShowVolume(const TrackView &t, int volume, UiIcon outputIcon, const char *outputName)
+{
+  volume = constrain(volume, 0, 100);
+  epd.fillRect(COL_X, LYR_Y, COL_W, LYR_H, GxEPD_WHITE);
+  textColor(GxEPD_BLACK, GxEPD_WHITE);
+
+  // Baris 1: ikon + nama output
+  drawIcon(outputIcon, COL_X, LYR_Y + 2, GxEPD_BLACK);
+  drawLeft(COL_X + 17, LYR_Y + 12, outputName, F_SMALL, COL_W - 60);
+
+  // Baris 2: label VOLUME + angka besar
+  u8g2.setFont(F_STATUS);
+  drawLeft(COL_X, LYR_Y + 24, "VOLUME", F_STATUS);
+  char num[8];
+  snprintf(num, sizeof(num), "%d", volume);
+  drawRight(COL_X + COL_W, LYR_Y + 24, num, F_BIG);
+
+  // Baris 3: meter segmen bergaya VU
+  const int segs = 26, segW = 6, gap = 1;
+  const int segY = LYR_Y + 30;
+  int active = (volume * segs + 50) / 100;
+  for (int i = 0; i < segs; i++) {
+    int x = COL_X + i * (segW + gap);
+    if (i < active) epd.fillRect(x, segY, segW, 10, GxEPD_BLACK);
+    else epd.fillRect(x, segY + 8, segW, 2, GxEPD_BLACK);
+  }
+
+  drawTransport(t);
+  refreshWindow(COL_X, LYR_Y, COL_W, TR_Y + TR_H - LYR_Y);
+}
+
+void displayMenu(const char *title, const StatusInfo &st,
+                 const MenuRow *rows, int count, int selected, bool fullRefresh)
 {
   epd.setFullWindow();
   epd.fillScreen(GxEPD_WHITE);
+  drawStatusBar(title, st);
 
-  setTextColors(GxEPD_BLACK, GxEPD_WHITE);
-  drawText(6, 14, "ABOUT WALKMAN DAP", MENU_FONT);
-  drawTextRight(SCREEN_W - 6, 14, FW_VERSION, TIME_FONT);
-  epd.drawFastHLine(0, 19, SCREEN_W, GxEPD_BLACK);
+  // Jendela gulir: pastikan baris terpilih selalu terlihat
+  int first = 0;
+  if (selected >= ROWS) first = selected - (ROWS - 1);
+  if (count > ROWS && first > count - ROWS) first = count - ROWS;
+  if (first < 0) first = 0;
 
-  char line1[64], line2[64], line3[64];
-  snprintf(line1, sizeof(line1), "Output : %s   |   Vol : %d%%", outputName, volumePercent);
-  snprintf(line2, sizeof(line2), "Mode   : %s", playModeName);
-  snprintf(line3, sizeof(line3), "RAM    : %u KB free  |  PSRAM : %u KB",
-           (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getFreePsram() / 1024));
+  const bool scroll = count > ROWS;
+  const int barRight = scroll ? 287 : SCREEN_W - 3;   // tepi kanan selection bar
+  const int contentRight = barRight - 4;
 
-  drawText(8, 38, line1, ARTIST_FONT);
-  drawText(8, 52, line2, ARTIST_FONT);
-  drawText(8, 66, line3, ARTIST_FONT);
+  for (int r = 0; r < ROWS; r++) {
+    int idx = first + r;
+    if (idx >= count) break;
+    const MenuRow &row = rows[idx];
+    const int top = LIST_Y + r * ROW_H;
+    const bool sel = (idx == selected);
+    const uint16_t fg = sel ? GxEPD_WHITE : GxEPD_BLACK;
+    const uint16_t bg = sel ? GxEPD_BLACK : GxEPD_WHITE;
 
-  epd.drawFastHLine(0, 74, SCREEN_W, GxEPD_BLACK);
-  drawText(8, 89, "Kontrol Knob : Putar = Scroll/Vol, Klik = Play/OK", ARTIST_FONT);
-  drawText(8, 103, "Tombol Fisik : [Prev]  [Next]  [Menu/Back]", ARTIST_FONT);
-  drawText(8, 117, "Serial Test  : w/s = Putar, Space = Klik, n/p/m", SUBTITLE_FONT);
+    if (sel) epd.fillRoundRect(2, top, barRight - 2, ROW_H, 3, GxEPD_BLACK);
+    textColor(fg, bg);
 
-  epd.display(false);
-  partialCount = 0;
+    int x = 8;
+    if (row.icon != ICON_NONE) {
+      drawIcon(row.icon, x, top + 3, fg);
+      x += 18;
+    }
+
+    int right = contentRight;
+    if (row.hasChildren) {
+      drawChevron(right - 4, top + 6, fg);
+      right -= 12;
+    }
+
+    int valueW = 0;
+    if (row.value && row.value[0]) {
+      valueW = min(textWidth(row.value, F_SMALL), 110);
+      drawRight(right, top + 13, row.value, F_SMALL, 110);
+      valueW += 10;
+    }
+
+    drawLeft(x, top + 13, row.label, sel ? F_ROW_SEL : F_ROW, right - valueW - x);
+  }
+
+  textColor(GxEPD_BLACK, GxEPD_WHITE);
+
+  // Scrollbar tipis
+  if (scroll) {
+    const int trackTop = LIST_Y + 2, trackH = ROWS * ROW_H - 4;
+    for (int yy = trackTop; yy < trackTop + trackH; yy += 2) epd.drawPixel(291, yy, GxEPD_BLACK);
+    int thumbH = max(8, trackH * ROWS / count);
+    int thumbY = trackTop + (trackH - thumbH) * first / (count - ROWS);
+    epd.fillRect(290, thumbY, 3, thumbH, GxEPD_BLACK);
+  }
+
+  if (fullRefresh) {
+    epd.display(false);
+    partialCount = 0;
+  } else {
+    epd.displayWindow(0, 0, SCREEN_W, SCREEN_H);   // scroll menu: partial tanpa kedip
+  }
 }
-

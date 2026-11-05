@@ -1,66 +1,89 @@
-// display.h — Driver E-Paper WeAct Studio 2.9" SSD1680 (296x128)
-// Mendukung 2 tampilan utama (gaya MusicStation v2 / Retro Walkman):
-//   1. Now Playing Screen : Header + Cover Art 96x96 + Synced Lyrics + Progress Bar + Volume Popup
-//   2. Library Menu Screen: Header + 6 Baris Daftar Menu/Lagu dengan Inverted Selection Bar
+// display.h — Driver & Desain UI E-Paper WeAct 2.9" SSD1680 (296x128)
+//
+// Bahasa desain: bersih ala perangkat pabrikan / Walkman retro —
+//   status bar tipis + garis rambut (hairline), ikon vektor 12x12,
+//   tipografi Helvetica, selection bar membulat, scrollbar tipis.
+//
+// Layar Now Playing:
+// +--------------------------------------------------------------+
+// | Now Playing                                  [rep] [hp] [bat] |  status bar
+// |--------------------------------------------------------------|
+// | +----------+  Judul Lagu (bold)                              |
+// | |          |  Artis · Album                                  |
+// | |  COVER   |  · · · · · · · · · · · · · · · · · · · · · · ·  |
+// | |  96x96   |        Lirik aktif (auto-size 2-3 baris)        |
+// | |          |  ====================o-----------------------   |
+// | +----------+  1:23                 |>                  3:45   |
+// +--------------------------------------------------------------+
 
 #pragma once
 #include <Arduino.h>
 
-constexpr int SCREEN_W = 296;
-constexpr int SCREEN_H = 128;
+constexpr int SCREEN_W    = 296;
+constexpr int SCREEN_H    = 128;
+constexpr int COVER_SIZE  = 96;
+constexpr int COVER_BYTES = (COVER_SIZE * COVER_SIZE) / 8;
 
-// Dimensi Layout Now Playing
-constexpr int COVER_X      = 4;
-constexpr int COVER_Y      = 32;
-constexpr int COVER_SIZE   = 96;
-constexpr int COVER_BYTES  = (COVER_SIZE * COVER_SIZE) / 8;
-constexpr int RIGHT_X      = 104;
-constexpr int RIGHT_W      = 192;
+enum UiIcon : uint8_t {
+  ICON_NONE = 0,
+  ICON_NOTE,
+  ICON_LIST,
+  ICON_ARTIST,
+  ICON_ALBUM,
+  ICON_HEADPHONES,
+  ICON_SPEAKER,
+  ICON_BLUETOOTH,
+  ICON_REPEAT,
+  ICON_REPEAT_ONE,
+  ICON_SHUFFLE,
+  ICON_INFO,
+  ICON_PLAY,
+  ICON_PAUSE,
+};
 
-constexpr int LYRIC_AREA_Y = 32;
-constexpr int LYRIC_AREA_H = 72;
+// Info status bar (dipakai semua layar)
+struct StatusInfo {
+  UiIcon outputIcon;   // ICON_HEADPHONES / ICON_SPEAKER / ICON_BLUETOOTH
+  UiIcon modeIcon;     // ICON_REPEAT / ICON_REPEAT_ONE / ICON_SHUFFLE
+  bool playing;
+  int batteryPct;      // 0..100, atau -1 = ditenagai USB (Fase 6 baru aktif)
+};
 
-constexpr int TRANSPORT_Y  = 104;
-constexpr int TRANSPORT_H  = 24;
+// Data lagu untuk layar Now Playing
+struct TrackView {
+  const char *title;
+  const char *artist;
+  const char *album;
+  const uint8_t *cover;     // bitmap 96x96 1-bit, atau nullptr
+  uint32_t elapsedSec;
+  uint32_t durationSec;
+  bool playing;
+};
 
-// Dimensi Layout Menu / Library (6 baris @ 18px = 108px, Y=20..127)
-constexpr int MENU_HEADER_H     = 20;
-constexpr int MENU_LIST_Y       = 20;
-constexpr int MENU_ROW_H        = 18;
-constexpr int MENU_VISIBLE_ROWS = 6;
+// Satu baris pada layar daftar/menu
+struct MenuRow {
+  const char *label;
+  const char *value;        // teks kecil rata kanan (boleh nullptr)
+  UiIcon icon;
+  bool hasChildren;         // tampilkan chevron ">"
+};
 
-// Inisialisasi SPI + layar E-Paper SSD1680. Panggil sekali di setup().
 void displayBegin();
+void displaySplash();
 
-// Layar Splash / Booting singkat.
-void displayDrawSplash();
+// Gambar seluruh layar Now Playing. fullRefresh=false -> partial seluruh layar (tanpa kedip).
+void displayNowPlaying(const StatusInfo &st, const TrackView &t,
+                       const char *lyric, bool hasLyrics, bool fullRefresh);
 
-// Layar Now Playing lengkap (Full Refresh).
-void displayDrawTrack(const char *title, const char *artist, const char *badgeRight,
-                      const uint8_t *coverBitmap,
-                      uint32_t elapsedSec, uint32_t durationSec, bool playing,
-                      const char *lyricText = nullptr);
+// Partial refresh area progress bar saja.
+void displayUpdateTransport(const TrackView &t);
 
-// Update hanya area transport / progress bar (Partial Refresh).
-void displayUpdateTransport(uint32_t elapsedSec, uint32_t durationSec, bool playing);
+// Partial refresh area lirik + progress bar.
+void displayUpdateLyrics(const TrackView &t, const char *lyric, bool hasLyrics);
 
-// Update hanya area lirik (Partial Refresh).
-void displayUpdateLyrics(const char *lyricText);
+// Tampilkan panel volume di area lirik (partial refresh).
+void displayShowVolume(const TrackView &t, int volume, UiIcon outputIcon, const char *outputName);
 
-// Update lirik + transport sekaligus dalam 1 Partial Refresh di kolom kanan.
-void displayUpdateLyricsAndTransport(const char *lyricText, uint32_t elapsedSec,
-                                     uint32_t durationSec, bool playing);
-
-// Tampilkan pop-up bar Volume di area kanan (Partial Refresh).
-void displayUpdateVolumePopup(int volumePercent, const char *outputName,
-                              uint32_t elapsedSec, uint32_t durationSec, bool playing);
-
-// Gambar layar Menu / Daftar Lagu (bisa Full Refresh saat pindah halaman,
-// atau Partial Refresh saat scroll naik/turun dengan Rotary Encoder).
-void displayDrawMenu(const char *headerTitle, const char *headerRight,
-                     const char *const *items, const char *const *rightLabels,
-                     int itemCount, int selectedIndex, bool fullRefresh);
-
-// Gambar layar informasi perangkat / bantuan kontrol.
-void displayDrawAbout(const char *outputName, const char *playModeName, int volumePercent);
-
+// Layar daftar/menu. selected = -1 untuk daftar info tanpa sorotan.
+void displayMenu(const char *title, const StatusInfo &st,
+                 const MenuRow *rows, int count, int selected, bool fullRefresh);

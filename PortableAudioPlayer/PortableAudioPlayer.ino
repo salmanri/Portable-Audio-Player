@@ -40,7 +40,7 @@ void setup()
   WiFi.mode(WIFI_OFF);
 
   displayBegin();
-  displayDrawSplash();
+  displaySplash();
 
   playerBegin();
   inputBegin();
