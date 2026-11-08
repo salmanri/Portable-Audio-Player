@@ -5,6 +5,7 @@
 #include "config.h"
 #include "pins.h"
 #include "lyrics.h"
+#include "sdcard.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <math.h>
@@ -76,6 +77,7 @@ static SemaphoreHandle_t playerMutex = nullptr;
 static PlayerState state = {};
 static uint8_t currentCover[COVER_BYTES];
 static unsigned long lastTickMillis = 0;
+static bool usingSdLibrary = false;
 
 // ---------------------------------------------------------------------------
 // Generator Cover Art 96x96 1-Bit (5 Gaya Retro Berbeda untuk Lagu Demo)
@@ -192,25 +194,57 @@ static void generateDemoCover(uint8_t style, uint8_t *bmp)
 static void lockPlayer()   { xSemaphoreTake(playerMutex, portMAX_DELAY); }
 static void unlockPlayer() { xSemaphoreGive(playerMutex); }
 
-static void loadTrackLocked(int index, bool autoPlay)
+static void selectTrack(int index, bool autoPlay)
 {
-  if (index < 0) index = DEMO_TRACK_COUNT - 1;
-  if (index >= DEMO_TRACK_COUNT) index = 0;
+  const int total = playerGetTrackCount();
+  if (total <= 0) return;
+  if (index < 0) index = total - 1;
+  if (index >= total) index = 0;
 
-  const TrackMetadata &m = DEMO_TRACKS[index];
-  state.active = true;
-  state.playing = autoPlay;
-  state.trackIndex = index;
-  strlcpy(state.title, m.title, sizeof(state.title));
-  strlcpy(state.artist, m.artist, sizeof(state.artist));
-  strlcpy(state.album, m.album, sizeof(state.album));
-  state.durationMs = m.durationSec * 1000UL;
-  state.positionMs = 0;
-  state.hasCover = true;
-  state.trackVersion++;
+  if (usingSdLibrary) {
+    const SdTrackEntry &sd = sdGetTrack(index);
+    uint8_t tempCover[COVER_BYTES];
+    bool gotCover = sdLoadCover(sd, tempCover);
+    sdLoadLyrics(sd);
 
-  generateDemoCover(m.artStyle, currentCover);
-  lastTickMillis = millis();
+    lockPlayer();
+    state.active = true;
+    state.playing = autoPlay;
+    state.trackIndex = index;
+    strlcpy(state.title, sd.title, sizeof(state.title));
+    strlcpy(state.artist, sd.artist, sizeof(state.artist));
+    strlcpy(state.album, sd.album, sizeof(state.album));
+    state.durationMs = max((uint32_t)1, sd.durationSec) * 1000UL;
+    state.positionMs = 0;
+    state.hasCover = gotCover;
+    if (gotCover) memcpy(currentCover, tempCover, COVER_BYTES);
+    state.trackVersion++;
+    lastTickMillis = millis();
+    unlockPlayer();
+
+    Serial.printf("[Player] SD Track [%d/%d]: %s - %s (%lus)\n",
+                  index + 1, total, sd.title, sd.artist, (unsigned long)sd.durationSec);
+  } else {
+    const TrackMetadata &m = DEMO_TRACKS[index];
+    lockPlayer();
+    state.active = true;
+    state.playing = autoPlay;
+    state.trackIndex = index;
+    strlcpy(state.title, m.title, sizeof(state.title));
+    strlcpy(state.artist, m.artist, sizeof(state.artist));
+    strlcpy(state.album, m.album, sizeof(state.album));
+    state.durationMs = m.durationSec * 1000UL;
+    state.positionMs = 0;
+    state.hasCover = true;
+    state.trackVersion++;
+    generateDemoCover(m.artStyle, currentCover);
+    lastTickMillis = millis();
+    unlockPlayer();
+
+    lyricsLoadFromText(m.lrcContent);
+    Serial.printf("[Player] Demo Track [%d/%d]: %s - %s\n",
+                  index + 1, total, m.title, m.artist);
+  }
 }
 
 void playerBegin()
@@ -221,17 +255,17 @@ void playerBegin()
   pinMode(AMP_SD, OUTPUT);
   digitalWrite(AMP_SD, LOW);
 
+  // Fase 3: Inisialisasi MicroSD & pindai lagu .mp3
+  sdBegin();
+  usingSdLibrary = (sdGetTrackCount() > 0);
+
   lockPlayer();
   state.volume = VOLUME_DEFAULT;
   state.outputMode = OUT_HEADPHONE_35MM;
   state.playMode = PLAY_REPEAT_ALL;
-  loadTrackLocked(0, true);
-  const char *lrc = DEMO_TRACKS[0].lrcContent;
   unlockPlayer();
 
-  lyricsLoadFromText(lrc);
-  Serial.printf("[Player] Siap: %d lagu dimuat. Lagu aktif: %s - %s\n",
-                DEMO_TRACK_COUNT, DEMO_TRACKS[0].title, DEMO_TRACKS[0].artist);
+  selectTrack(0, true);
 }
 
 void playerTick()
@@ -262,15 +296,7 @@ void playerTick()
 
 void playerPlayTrack(int index)
 {
-  lockPlayer();
-  loadTrackLocked(index, true);
-  int idx = state.trackIndex;
-  const char *lrc = DEMO_TRACKS[idx].lrcContent;
-  unlockPlayer();
-
-  lyricsLoadFromText(lrc);
-  Serial.printf("[Player] Memutar [%d/%d]: %s - %s\n",
-                idx + 1, DEMO_TRACK_COUNT, DEMO_TRACKS[idx].title, DEMO_TRACKS[idx].artist);
+  selectTrack(index, true);
 }
 
 void playerTogglePause()
@@ -286,27 +312,24 @@ void playerTogglePause()
 
 void playerNext()
 {
+  const int total = playerGetTrackCount();
   lockPlayer();
   int nextIdx = state.trackIndex + 1;
-  if (state.playMode == PLAY_SHUFFLE && DEMO_TRACK_COUNT > 1) {
-    int r = random(0, DEMO_TRACK_COUNT - 1);
+  if (state.playMode == PLAY_SHUFFLE && total > 1) {
+    int r = random(0, total - 1);
     if (r >= state.trackIndex) r++;
     nextIdx = r;
-  } else if (nextIdx >= DEMO_TRACK_COUNT) {
+  } else if (nextIdx >= total) {
     nextIdx = 0;
   }
-  loadTrackLocked(nextIdx, true);
-  int idx = state.trackIndex;
-  const char *lrc = DEMO_TRACKS[idx].lrcContent;
   unlockPlayer();
 
-  lyricsLoadFromText(lrc);
-  Serial.printf("[Player] Next -> [%d/%d]: %s - %s\n",
-                idx + 1, DEMO_TRACK_COUNT, DEMO_TRACKS[idx].title, DEMO_TRACKS[idx].artist);
+  selectTrack(nextIdx, true);
 }
 
 void playerPrev()
 {
+  const int total = playerGetTrackCount();
   lockPlayer();
   if (state.positionMs > PREV_RESTART_MS) {
     // Jika lagu sudah jalan > 3 detik, tombol Prev mengulang dari detik 0:00
@@ -318,15 +341,10 @@ void playerPrev()
   }
 
   int prevIdx = state.trackIndex - 1;
-  if (prevIdx < 0) prevIdx = DEMO_TRACK_COUNT - 1;
-  loadTrackLocked(prevIdx, true);
-  int idx = state.trackIndex;
-  const char *lrc = DEMO_TRACKS[idx].lrcContent;
+  if (prevIdx < 0) prevIdx = total - 1;
   unlockPlayer();
 
-  lyricsLoadFromText(lrc);
-  Serial.printf("[Player] Prev -> [%d/%d]: %s - %s\n",
-                idx + 1, DEMO_TRACK_COUNT, DEMO_TRACKS[idx].title, DEMO_TRACKS[idx].artist);
+  selectTrack(prevIdx, true);
 }
 
 void playerSeekRelativeMs(int32_t deltaMs)
@@ -439,11 +457,22 @@ const char *playerGetPlayModeName(PlayMode mode)
 
 int playerGetTrackCount()
 {
-  return DEMO_TRACK_COUNT;
+  return usingSdLibrary ? sdGetTrackCount() : DEMO_TRACK_COUNT;
 }
 
 const TrackMetadata &playerGetTrackMeta(int index)
 {
+  if (usingSdLibrary) {
+    static TrackMetadata sdMeta;
+    const SdTrackEntry &e = sdGetTrack(index);
+    sdMeta.title       = e.title;
+    sdMeta.artist      = e.artist;
+    sdMeta.album       = e.album;
+    sdMeta.durationSec = e.durationSec;
+    sdMeta.artStyle    = 0;
+    sdMeta.lrcContent  = nullptr;
+    return sdMeta;
+  }
   if (index < 0 || index >= DEMO_TRACK_COUNT) index = 0;
   return DEMO_TRACKS[index];
 }

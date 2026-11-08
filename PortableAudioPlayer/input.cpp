@@ -8,6 +8,7 @@
 #include "input.h"
 #include "pins.h"
 #include "config.h"
+#include <esp_timer.h>
 
 #ifndef ENABLE_HARDWARE_INPUT
 #define ENABLE_HARDWARE_INPUT 1
@@ -77,28 +78,56 @@ static void IRAM_ATTR onEncoderISR()
 }
 
 // ---------------------------------------------------------------------------
-// 2. Interrupt Instan untuk Keempat Tombol (ENC_SW, PREV, NEXT, MENU)
-//    Langsung merespons pada sentuhan pertama (FALLING edge) dengan proteksi
-//    anti-pantul (cooldown 170 ms), tidak perlu ditekan lama!
+// 2. Hardware Timer 2 ms (500 Hz) State-Machine Debouncer untuk Keempat Tombol
+//    Berjalan di background setiap 2 ms (bahkan saat layar E-Paper sedang refresh!).
+//    - Begitu tombol terdeteksi LOW selama 2 tick (4 ms), event langsung dikirim instan!
+//    - Bebas 100% dari gagal baca akibat micro-bounce (2 us) maupun pantulan saat lepas tombol.
 // ---------------------------------------------------------------------------
-constexpr uint32_t BTN_COOLDOWN_MS = 170;
-static volatile uint32_t lastClickMs[4] = {0, 0, 0, 0};
+struct BtnScanner {
+  uint8_t pin;
+  InputEvent evt;
+  bool pressed;
+  uint8_t count;
+};
 
-static void IRAM_ATTR handleButtonISR(uint8_t idx, uint8_t pin, InputEvent evt)
+static volatile BtnScanner btns[4] = {
+  { ENC_SW,   EVT_ENC_CLICK, false, 0 },
+  { BTN_PREV, EVT_BTN_PREV,  false, 0 },
+  { BTN_NEXT, EVT_BTN_NEXT,  false, 0 },
+  { BTN_MENU, EVT_BTN_MENU,  false, 0 },
+};
+
+static esp_timer_handle_t btnTimer = nullptr;
+
+static void IRAM_ATTR onButtonTimerISR(void *arg)
 {
-  if (digitalRead(pin) == LOW) {
-    uint32_t now = (uint32_t)millis();
-    if (now - lastClickMs[idx] >= BTN_COOLDOWN_MS) {
-      lastClickMs[idx] = now;
-      pushEventISR(evt);
+  (void)arg;
+  for (int i = 0; i < 4; i++) {
+    bool isLow = (digitalRead(btns[i].pin) == LOW);
+    if (!btns[i].pressed) {
+      // Tombol sedang dilepas: butuh 2 sampel LOW berturut-turut (4 ms) untuk dianggap ditekan
+      if (isLow) {
+        if (++btns[i].count >= 2) {
+          btns[i].pressed = true;
+          btns[i].count = 0;
+          pushEventISR(btns[i].evt);
+        }
+      } else {
+        btns[i].count = 0;
+      }
+    } else {
+      // Tombol sedang ditekan: butuh 12 sampel HIGH berturut-turut (24 ms) untuk siap ditekan lagi
+      if (!isLow) {
+        if (++btns[i].count >= 12) {
+          btns[i].pressed = false;
+          btns[i].count = 0;
+        }
+      } else {
+        btns[i].count = 0;
+      }
     }
   }
 }
-
-static void IRAM_ATTR onBtnEncSwISR() { handleButtonISR(0, ENC_SW,   EVT_ENC_CLICK); }
-static void IRAM_ATTR onBtnPrevISR()  { handleButtonISR(1, BTN_PREV, EVT_BTN_PREV);  }
-static void IRAM_ATTR onBtnNextISR()  { handleButtonISR(2, BTN_NEXT, EVT_BTN_NEXT);  }
-static void IRAM_ATTR onBtnMenuISR()  { handleButtonISR(3, BTN_MENU, EVT_BTN_MENU);  }
 #endif
 
 void inputPrintHelp()
@@ -129,11 +158,17 @@ void inputBegin()
   attachInterrupt(digitalPinToInterrupt(ENC_CLK), onEncoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_DT),  onEncoderISR, CHANGE);
 
-  // Pasang interrupt FALLING untuk semua tombol agar 1x sentuh langsung terdeteksi instan!
-  attachInterrupt(digitalPinToInterrupt(ENC_SW),   onBtnEncSwISR, FALLING);
-  attachInterrupt(digitalPinToInterrupt(BTN_PREV), onBtnPrevISR,  FALLING);
-  attachInterrupt(digitalPinToInterrupt(BTN_NEXT), onBtnNextISR,  FALLING);
-  attachInterrupt(digitalPinToInterrupt(BTN_MENU), onBtnMenuISR,  FALLING);
+  // Jalankan hardware timer 2 ms (2000 us) di background untuk memindai keempat tombol
+  const esp_timer_create_args_t timerArgs = {
+    .callback = &onButtonTimerISR,
+    .arg = nullptr,
+    .dispatch_method = ESP_TIMER_TASK,
+    .name = "btn_scan",
+    .skip_unhandled_events = true
+  };
+  if (esp_timer_create(&timerArgs, &btnTimer) == ESP_OK) {
+    esp_timer_start_periodic(btnTimer, 2000); // 2000 us = 2 ms
+  }
 #endif
   inputPrintHelp();
 }

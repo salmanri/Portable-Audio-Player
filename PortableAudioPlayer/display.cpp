@@ -451,6 +451,7 @@ static void drawLyrics(const char *text, bool hasLyrics)
 
 static void refreshWindow(int x, int y, int w, int h)
 {
+  digitalWrite(SD_CS, HIGH);
   if (++partialCount >= FULL_REFRESH_AFTER_PARTIALS) {
     epd.display(false);   // full refresh berkala untuk membersihkan ghosting
     partialCount = 0;
@@ -464,7 +465,13 @@ static void refreshWindow(int x, int y, int w, int h)
 // ---------------------------------------------------------------------------
 void displayBegin()
 {
-  SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
+  pinMode(EPD_CS, OUTPUT);
+  digitalWrite(EPD_CS, HIGH);
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+
+  SPI.end();
+  SPI.begin(EPD_SCK, SD_MISO, EPD_MOSI, -1);
   epd.epd2.selectSPI(SPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
 
   epd.init(115200, true, 2, false);
@@ -620,10 +627,11 @@ void displayMenu(const char *title, const StatusInfo &st,
     epd.fillRect(290, thumbY, 3, thumbH, GxEPD_BLACK);
   }
 
+  digitalWrite(SD_CS, HIGH);
   if (fullRefresh) {
     epd.display(false);
     partialCount = 0;
   } else {
-    epd.displayWindow(0, 0, SCREEN_W, SCREEN_H);   // scroll menu: partial tanpa kedip
+    refreshWindow(0, 0, SCREEN_W, SCREEN_H);   // partial cepat tanpa kedip (~280 ms)
   }
 }

@@ -2,7 +2,10 @@
 #pragma once
 
 #define FW_NAME        "Portable Audio Player"
-#define FW_VERSION     "0.3.0"
+#define FW_VERSION     "0.4.0"
+
+// Kapasitas daftar lagu dari MicroSD di RAM
+#define MAX_SD_TRACKS  48
 
 // Identitas perangkat yang tampil di layar splash & About (boleh diganti sesuka hati)
 #define DEVICE_MODEL   "PA-01"

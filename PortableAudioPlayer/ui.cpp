@@ -5,6 +5,7 @@
 #include "display.h"
 #include "player.h"
 #include "lyrics.h"
+#include "sdcard.h"
 #include <string.h>
 
 static UiScreen currentScreen = SCREEN_NOW_PLAYING;
@@ -96,17 +97,18 @@ static int countUnique(bool artist)
   return u;
 }
 
-static void requestMenuRedraw(bool full)
+static void requestMenuRedraw(bool full, bool immediate = false)
 {
   menuDirty = true;
   if (full) menuFull = true;
-  lastInputMillis = millis();
+  lastInputMillis = immediate ? (millis() - INPUT_SETTLE_MS) : millis();
 }
 
 static void openScreen(UiScreen scr)
 {
   currentScreen = scr;
-  requestMenuRedraw(true);
+  // Gunakan partial refresh cepat (~280 ms tanpa kedip) & gambar langsung (0 ms delay)
+  requestMenuRedraw(false, true);
 }
 
 static void switchToNowPlaying()
@@ -127,9 +129,9 @@ static void renderMenu(bool full)
   StatusInfo st;
   buildStatus(s, st);
 
-  static MenuRow rows[32];
-  static char values[32][24];
-  const int n = playerGetTrackCount();
+  static MenuRow rows[MAX_SD_TRACKS];
+  static char values[MAX_SD_TRACKS][24];
+  const int n = min(playerGetTrackCount(), (int)MAX_SD_TRACKS);
 
   if (currentScreen == SCREEN_MAIN_MENU) {
     snprintf(values[0], sizeof(values[0]), "%s", s.playing ? "Playing" : "Paused");
@@ -147,7 +149,7 @@ static void renderMenu(bool full)
     displayMenu("Menu", st, rows, MAIN_MENU_COUNT, mainMenuIdx, full);
 
   } else if (currentScreen == SCREEN_TRACK_LIST) {
-    for (int i = 0; i < n && i < 32; i++) {
+    for (int i = 0; i < n; i++) {
       const TrackMetadata &m = playerGetTrackMeta(i);
       snprintf(values[i], sizeof(values[i]), "%lu:%02lu",
                (unsigned long)(m.durationSec / 60), (unsigned long)(m.durationSec % 60));
@@ -156,27 +158,32 @@ static void renderMenu(bool full)
     displayMenu("Songs", st, rows, n, subMenuIdx, full);
 
   } else if (currentScreen == SCREEN_ARTIST_LIST) {
-    for (int i = 0; i < n && i < 32; i++) {
+    for (int i = 0; i < n; i++) {
       const TrackMetadata &m = playerGetTrackMeta(i);
       rows[i] = { m.artist, m.title, ICON_ARTIST, false };
     }
     displayMenu("Artists", st, rows, n, subMenuIdx, full);
 
   } else if (currentScreen == SCREEN_ALBUM_LIST) {
-    for (int i = 0; i < n && i < 32; i++) {
+    for (int i = 0; i < n; i++) {
       const TrackMetadata &m = playerGetTrackMeta(i);
       rows[i] = { m.album, m.artist, ICON_ALBUM, false };
     }
     displayMenu("Albums", st, rows, n, subMenuIdx, full);
 
   } else if (currentScreen == SCREEN_ABOUT) {
-    snprintf(values[0], sizeof(values[0]), "%d%%", s.volume);
+    if (sdIsMounted()) {
+      snprintf(values[0], sizeof(values[0]), "%d MP3 (%lluMB)",
+               sdGetTrackCount(), sdGetTotalMB());
+    } else {
+      snprintf(values[0], sizeof(values[0]), "No SD (Demo)");
+    }
     snprintf(values[1], sizeof(values[1]), "%u KB", (unsigned)(ESP.getFreeHeap() / 1024));
     rows[0] = { "Model",     DEVICE_MODEL, ICON_NONE, false };
     rows[1] = { "Firmware",  FW_VERSION,   ICON_NONE, false };
-    rows[2] = { "Output",    outputLabel(s.outputMode), ICON_NONE, false };
-    rows[3] = { "Play Mode", playerGetPlayModeName(s.playMode), ICON_NONE, false };
-    rows[4] = { "Volume",    values[0], ICON_NONE, false };
+    rows[2] = { "MicroSD",   values[0],    ICON_NONE, false };
+    rows[3] = { "Output",    outputLabel(s.outputMode), ICON_NONE, false };
+    rows[4] = { "Play Mode", playerGetPlayModeName(s.playMode), ICON_NONE, false };
     rows[5] = { "Free RAM",  values[1], ICON_NONE, false };
     displayMenu("About", st, rows, 6, -1, full);
   }
@@ -204,7 +211,7 @@ void uiHandleInput(InputEvent evt)
   if (evt == EVT_BTN_NEXT || evt == EVT_BTN_PREV) {
     if (evt == EVT_BTN_NEXT) playerNext();
     else playerPrev();
-    if (currentScreen != SCREEN_NOW_PLAYING) requestMenuRedraw(false);
+    if (currentScreen != SCREEN_NOW_PLAYING) requestMenuRedraw(false, true);
     return;
   }
 
@@ -238,8 +245,8 @@ void uiHandleInput(InputEvent evt)
           case 1: subMenuIdx = 0; openScreen(SCREEN_TRACK_LIST); break;
           case 2: subMenuIdx = 0; openScreen(SCREEN_ARTIST_LIST); break;
           case 3: subMenuIdx = 0; openScreen(SCREEN_ALBUM_LIST); break;
-          case 4: playerCycleOutputMode(); requestMenuRedraw(false); break;
-          case 5: playerCyclePlayMode();   requestMenuRedraw(false); break;
+          case 4: playerCycleOutputMode(); requestMenuRedraw(false, true); break;
+          case 5: playerCyclePlayMode();   requestMenuRedraw(false, true); break;
           case 6: openScreen(SCREEN_ABOUT); break;
         }
       }
@@ -299,9 +306,11 @@ void uiTick()
   char lyric[LYRIC_TEXT_LEN];
   lyricsGetCurrent(posMs, LYRIC_LEAD_MS, lyric, sizeof(lyric));
 
-  // a. Lagu baru (full refresh) atau kembali dari menu (partial seluruh layar)
+  // a. Lagu baru atau kembali dari menu:
+  //    Full refresh hanya saat pertama kali boot (seenTrackVersion == 0),
+  //    sedangkan ganti lagu NEXT/PREV/Menu memakai partial refresh cepat (~280 ms tanpa kedip).
   if (s.trackVersion != seenTrackVersion || npRedraw) {
-    const bool full = (s.trackVersion != seenTrackVersion);
+    const bool full = (seenTrackVersion == 0);
     seenTrackVersion = s.trackVersion;
     npRedraw  = false;
     volActive = false;
