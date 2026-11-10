@@ -17,6 +17,11 @@ struct SdTrackEntry {
   uint32_t durationSec;  // Durasi lagu (detik) dari TLEN / bitrate frame MP3
   uint32_t apicOffset;   // Offset byte gambar JPEG embedded (APIC) di dalam file MP3 (0 = tidak ada)
   uint32_t apicSize;     // Ukuran byte gambar JPEG embedded (APIC)
+  uint32_t usltOffset;   // Offset byte lirik embedded (USLT) di dalam file MP3 (0 = tidak ada)
+  uint32_t usltSize;     // Ukuran byte frame lirik embedded (USLT)
+  uint8_t *coverBmp;     // Pre-cache RAM cover art 96x96 1-bit (1152 byte)
+  char    *lrcText;      // Pre-cache RAM isi file lirik .lrc / USLT
+  uint16_t lrcLineCount; // Jumlah baris lirik yang berhasil di-parse saat boot
 };
 
 // Inisialisasi modul MicroSD pada bus VSPI (CS = GPIO 15) dan pindai seluruh file .mp3.

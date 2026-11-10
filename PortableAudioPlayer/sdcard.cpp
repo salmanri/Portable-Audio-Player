@@ -297,6 +297,10 @@ static void parseMp3Metadata(const char *path, SdTrackEntry &entry)
             break;
           }
         }
+      } else if ((strcmp(id, "USLT") == 0 || strcmp(id, "ULT") == 0) &&
+                 entry.usltOffset == 0 && fSize > 10) {
+        entry.usltOffset = dataPos;
+        entry.usltSize   = fSize;
       }
 
       pos = dataPos + fSize;
@@ -576,16 +580,21 @@ static bool decodeJpegSliceToCover(const char *path, uint32_t offset, uint32_t s
     return false;
   }
 
-  // Pilih skala dekode DCT perangkat keras agar ukuran mendekati >= 96x96
+  // PENTING:
+  // 1) Untuk Progressive JPEG (0xFFC2, mis. sampul Spotify 640x640 dari spotdl),
+  //    JPEGDEC hanya mendukung JPEG_SCALE_EIGHTH (div = 8).
+  // 2) Hindari JPEG_SCALE_QUARTER di JPEGDEC karena bug internal di JPEGPutMCU22.
+  //    Untuk gambar >= 320px gunakan JPEG_SCALE_EIGHTH (ekstraksi DC cepat & akurat),
+  //    dan untuk 192..319px gunakan JPEG_SCALE_HALF (div = 2).
+  const bool isProg = (ws->jpeg.getJPEGType() == JPEG_MODE_PROGRESSIVE);
   int scaleOpt = 0;
   int div = 1;
   int minDim = min(srcW, srcH);
-  if (minDim >= COVER_SIZE * 8)      { scaleOpt = JPEG_SCALE_EIGHTH;  div = 8; }
-  else if (minDim >= COVER_SIZE * 4) { scaleOpt = JPEG_SCALE_QUARTER; div = 4; }
-  else if (minDim >= COVER_SIZE * 2) { scaleOpt = JPEG_SCALE_HALF;    div = 2; }
+  if (isProg || minDim >= 320)      { scaleOpt = JPEG_SCALE_EIGHTH; div = 8; }
+  else if (minDim >= COVER_SIZE * 2) { scaleOpt = JPEG_SCALE_HALF;   div = 2; }
 
-  int decW = srcW / div;
-  int decH = srcH / div;
+  int decW = max(1, srcW / div);
+  int decH = max(1, srcH / div);
   ws->cropS = max(1, min(decW, decH));
   ws->cropX = (decW - ws->cropS) / 2;
   ws->cropY = (decH - ws->cropS) / 2;
@@ -604,19 +613,63 @@ static bool decodeJpegSliceToCover(const char *path, uint32_t offset, uint32_t s
     return false;
   }
 
-  // Hitung rata-rata piksel 96x96 & mean luminansi untuk kontras 1.25x
-  // Gunakan ulang buffer accSum sebagai int16_t errBuf
+  // Hitung rata-rata piksel 96x96 & histogram untuk Auto-Levels (persentil 2%..98%)
+  // supaya sampul gelap (Adele - 19, Kendrick - GNX) maupun sepia (Silk Sonic)
+  // tetap memiliki rentang kontras penuh 0..255 di layar E-Paper 1-bit.
   int16_t *errBuf = (int16_t *)ws->accSum;
+  uint16_t hist[256];
+  memset(hist, 0, sizeof(hist));
+
   uint32_t totalLuma = 0;
-  for (int i = 0; i < COVER_SIZE * COVER_SIZE; i++) {
-    uint8_t v = ws->accCnt[i] ? (uint8_t)(ws->accSum[i] / ws->accCnt[i]) : 255;
-    errBuf[i] = v;
-    totalLuma += v;
-  }
-  int mean = (int)(totalLuma / (COVER_SIZE * COVER_SIZE));
+  int filledPixels = 0;
+  int minLuma = 255;
+  int maxLuma = 0;
 
   for (int i = 0; i < COVER_SIZE * COVER_SIZE; i++) {
-    int v = mean + ((errBuf[i] - mean) * 5) / 4;
+    uint8_t v = 255;
+    if (ws->accCnt[i] > 0) {
+      v = (uint8_t)(ws->accSum[i] / ws->accCnt[i]);
+      filledPixels++;
+      if (v < minLuma) minLuma = v;
+      if (v > maxLuma) maxLuma = v;
+    }
+    errBuf[i] = v;
+    hist[v]++;
+    totalLuma += v;
+  }
+
+  int mean = (int)(totalLuma / (COVER_SIZE * COVER_SIZE));
+  Serial.printf("[SD] Cover JPEG %dx%d (%s, 1/%d) -> luma %d..%d (mean=%d)\n",
+                srcW, srcH, isProg ? "Prog" : "Base", div, minLuma, maxLuma, mean);
+
+  // Jika gambar kosong / gagal terdekode (rentang kontras < 3), batalkan agar fallback ke ikon
+  if (filledPixels < (COVER_SIZE * COVER_SIZE) / 2 || (maxLuma - minLuma) < 3) {
+    gWs = nullptr;
+    free(ws);
+    return false;
+  }
+
+  // Cari titik hitam (persentil 2%) dan titik putih (persentil 98%)
+  const int totalPx = COVER_SIZE * COVER_SIZE;
+  int pLo = minLuma, pHi = maxLuma;
+  int acc = 0;
+  for (int v = 0; v < 256; v++) {
+    acc += hist[v];
+    if (acc >= (totalPx * 2) / 100) { pLo = v; break; }
+  }
+  acc = 0;
+  for (int v = 255; v >= 0; v--) {
+    acc += hist[v];
+    if (acc >= (totalPx * 2) / 100) { pHi = v; break; }
+  }
+  if (pHi <= pLo + 8) {
+    pLo = minLuma;
+    pHi = maxLuma;
+  }
+  int span = max(1, pHi - pLo);
+
+  for (int i = 0; i < totalPx; i++) {
+    int v = ((errBuf[i] - pLo) * 255) / span;
     errBuf[i] = (int16_t)constrain(v, 0, 255);
   }
 
@@ -651,109 +704,300 @@ static bool decodeJpegSliceToCover(const char *path, uint32_t offset, uint32_t s
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Pembaca Cover & Lirik dari Disk (Dipakai untuk Pre-Cache RAM saat Boot)
 // ---------------------------------------------------------------------------
-// Bangunkan & sinkronkan ulang kartu MicroSD ke mode SPI Idle (0x01) menggunakan
-// hardware SPI (tanpa pernah memanggil pinMode pada SCK/MOSI/MISO agar E-Paper tetap aman).
-static uint8_t spiWakeSd()
+static bool loadCoverFromDisk(const SdTrackEntry &track, uint8_t *coverOut)
 {
-  digitalWrite(EPD_CS, HIGH);
+  if (!mounted || !track.path[0] || !coverOut) return false;
+
+  // 1. Prioritaskan gambar JPEG embedded (ID3v2 APIC) di dalam file .mp3
+  //    (langsung ke offset byte tanpa perlu mencari file lain di FAT32)
+  if (track.apicOffset > 0 && track.apicSize > 64) {
+    if (decodeJpegSliceToCover(track.path, track.apicOffset, track.apicSize, coverOut)) {
+      return true;
+    }
+  }
+
+  // 2. Cek file gambar "<nama_lagu>.jpg" atau "<nama_lagu>.jpeg" di sebelah file .mp3
+  const char *imgExts[] = { ".jpg", ".JPG", ".jpeg", ".JPEG" };
+  char imgPath[140];
+  for (const char *ext : imgExts) {
+    replaceExtension(track.path, ext, imgPath, sizeof(imgPath));
+    if (decodeJpegSliceToCover(imgPath, 0, 0, coverOut)) {
+      return true;
+    }
+  }
+
+  // 3. Cek "cover.jpg" atau "folder.jpg" di folder tempat lagu berada
+  char dir[128];
+  parentDirOf(track.path, dir, sizeof(dir));
+  const char *folderCovers[] = { "cover.jpg", "Cover.jpg", "folder.jpg", "front.jpg" };
+  for (const char *fc : folderCovers) {
+    if (strcmp(dir, "/") == 0) snprintf(imgPath, sizeof(imgPath), "/%s", fc);
+    else snprintf(imgPath, sizeof(imgPath), "%s/%s", dir, fc);
+    if (decodeJpegSliceToCover(imgPath, 0, 0, coverOut)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static char *readFileToHeapString(File &f, size_t maxBytes = 8192)
+{
+  size_t sz = f.size();
+  if (sz == 0) return nullptr;
+  if (sz > maxBytes) sz = maxBytes;
+  if (ESP.getFreeHeap() < sz + 40960) return nullptr;
+
+  char *buf = (char *)malloc(sz + 1);
+  if (!buf) return nullptr;
+  size_t rd = f.read((uint8_t *)buf, sz);
+  buf[rd] = '\0';
+  return buf;
+}
+
+// Ekstrak teks lirik dari frame ID3v2 USLT jika file .lrc eksternal tidak ada
+static char *readUsltFromMp3(const SdTrackEntry &track)
+{
+  if (track.usltOffset == 0 || track.usltSize <= 6) return nullptr;
+  File f = SD.open(track.path, FILE_READ);
+  if (!f) return nullptr;
+
+  uint32_t sz = min(track.usltSize, (uint32_t)6144);
+  if (ESP.getFreeHeap() < sz * 2 + 40960) { f.close(); return nullptr; }
+
+  uint8_t *raw = (uint8_t *)malloc(sz);
+  if (!raw) { f.close(); return nullptr; }
+  f.seek(track.usltOffset);
+  size_t rd = f.read(raw, sz);
+  f.close();
+  if (rd <= 6) { free(raw); return nullptr; }
+
+  uint8_t enc = raw[0];
+  // Lewati 1 byte encoding + 3 byte kode bahasa ("eng"/"xxx") + content descriptor null-terminated
+  size_t pos = 4;
+  if (enc == 0 || enc == 3) {
+    while (pos < rd && raw[pos] != 0) pos++;
+    if (pos < rd) pos++; // lewati 0x00
+  } else {
+    while (pos + 1 < rd && (raw[pos] != 0 || raw[pos + 1] != 0)) pos += 2;
+    if (pos + 1 < rd) pos += 2; // lewati 0x00 0x00
+  }
+  if (pos >= rd) { free(raw); return nullptr; }
+
+  size_t bodyLen = rd - pos;
+  size_t outMax  = bodyLen + 64;
+  char *out = (char *)malloc(outMax);
+  if (!out) { free(raw); return nullptr; }
+
+  // Buat buffer sementara dengan byte encoding di depannya agar decodeId3Text bisa langsung dipakai
+  raw[pos - 1] = enc;
+  decodeId3Text(&raw[pos - 1], bodyLen + 1, out, outMax);
+  free(raw);
+
+  if (!out[0]) { free(out); return nullptr; }
+  return out;
+}
+
+static char *loadLyricsTextFromDisk(const SdTrackEntry &track)
+{
+  if (!mounted || !track.path[0]) return nullptr;
+
+  const char *exts[] = { ".lrc", ".LRC" };
+  char lrcPath[140];
+
+  // 1. Cek file .lrc dengan nama & folder yang sama dengan file .mp3
+  for (const char *ext : exts) {
+    replaceExtension(track.path, ext, lrcPath, sizeof(lrcPath));
+    File f = SD.open(lrcPath, FILE_READ);
+    if (f && !f.isDirectory()) {
+      char *txt = readFileToHeapString(f);
+      f.close();
+      if (txt && txt[0]) return txt;
+      if (txt) free(txt);
+    } else if (f) {
+      f.close();
+    }
+  }
+
+  // 2. Cek di folder "/lyrics/<nama_file>.lrc"
+  char baseLrc[96];
+  replaceExtension(baseNameOf(track.path), ".lrc", baseLrc, sizeof(baseLrc));
+  snprintf(lrcPath, sizeof(lrcPath), "/lyrics/%s", baseLrc);
+  {
+    File f = SD.open(lrcPath, FILE_READ);
+    if (f && !f.isDirectory()) {
+      char *txt = readFileToHeapString(f);
+      f.close();
+      if (txt && txt[0]) return txt;
+      if (txt) free(txt);
+    } else if (f) {
+      f.close();
+    }
+  }
+
+  // 3. Cari file .lrc di folder lagu yang namanya mengandung judul lagu (case-insensitive)
+  if (track.title[0]) {
+    char dirPath[128];
+    parentDirOf(track.path, dirPath, sizeof(dirPath));
+    File dir = SD.open(dirPath);
+    if (dir && dir.isDirectory()) {
+      while (true) {
+        File entry = dir.openNextFile();
+        if (!entry) break;
+        bool isDir = entry.isDirectory();
+        const char *nm = entry.name();
+        if (!isDir && nm && endsWithIgnoreCase(nm, ".lrc") && strcasestr(nm, track.title) != nullptr) {
+          char *txt = readFileToHeapString(entry);
+          entry.close();
+          dir.close();
+          if (txt && txt[0]) return txt;
+          if (txt) free(txt);
+          break;
+        }
+        entry.close();
+      }
+      dir.close();
+    } else if (dir) {
+      dir.close();
+    }
+  }
+
+  // 4. Fallback ke lirik embedded di dalam tag ID3v2 USLT (disematkan otomatis oleh spotdl)
+  return readUsltFromMp3(track);
+}
+
+// ---------------------------------------------------------------------------
+// Public API & Penanganan Bus SPI Bersama (SD + E-Paper)
+// ---------------------------------------------------------------------------
+// Lepaskan MISO kartu MicroSD secara bersih dengan mengirim 16 clock 0xFF saat CS=HIGH
+static void releaseSdSpiBus()
+{
   digitalWrite(SD_CS, HIGH);
+  digitalWrite(EPD_CS, HIGH);
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+  SPI.transfer(0xFF);
+  SPI.transfer(0xFF);
+  SPI.endTransaction();
+}
+
+// Bangunkan & pulihkan state SPI kartu MicroSD (baik saat Cold Boot maupun Warm Restart tombol EN)
+// PENTING: JANGAN PERNAH mengeset pin CS(15) ke INPUT_PULLDOWN karena akan menarik CS=LOW (aktif)
+//          dan membuat kartu MicroSD kemasukan clock sampah!
+static uint8_t bitBangWakeSd(int csPin, int sckPin, int mosiPin, int misoPin)
+{
+  SPI.end(); // Lepaskan hardware SPI sebelum bit-bang
+
+  pinMode(EPD_CS, OUTPUT);  digitalWrite(EPD_CS, HIGH);
+  pinMode(csPin, OUTPUT);   digitalWrite(csPin, HIGH);
+  pinMode(sckPin, OUTPUT);  digitalWrite(sckPin, LOW);
+  pinMode(mosiPin, OUTPUT); digitalWrite(mosiPin, HIGH);
+  pinMode(misoPin, INPUT_PULLUP);
+  gpio_pullup_en((gpio_num_t)misoPin);
+  gpio_pullup_en((gpio_num_t)mosiPin);
+  gpio_pullup_en((gpio_num_t)csPin);
+  delay(15);
+
+  auto bbTransfer = [&](uint8_t out) -> uint8_t {
+    uint8_t in = 0;
+    for (int bit = 7; bit >= 0; bit--) {
+      digitalWrite(mosiPin, (out >> bit) & 1);
+      delayMicroseconds(4);
+      digitalWrite(sckPin, HIGH);
+      delayMicroseconds(4);
+      in = (uint8_t)((in << 1) | (digitalRead(misoPin) ? 1 : 0));
+      digitalWrite(sckPin, LOW);
+    }
+    return in;
+  };
+
+  // 1. Kirim 100 byte (800 clock) 0xFF dengan CS=HIGH untuk membangunkan kartu ke mode native
+  digitalWrite(csPin, HIGH);
+  for (int i = 0; i < 100; i++) bbTransfer(0xFF);
 
   uint8_t r1 = 0xFF;
-  SPI.beginTransaction(SPISettings(250000, MSBFIRST, SPI_MODE0));
+  for (int attempt = 0; attempt < 6 && r1 != 0x01; attempt++) {
+    // Jika percobaan sebelumnya belum dapat 0x01 (mis. saat tombol Reset EN ditekan di tengah jalan),
+    // kirim 520 byte 0xFF + CMD12 (STOP_TRANSMISSION) untuk menghentikan pembacaan yang menggantung.
+    if (attempt == 2 || attempt == 4) {
+      digitalWrite(csPin, LOW);
+      for (int i = 0; i < 520; i++) bbTransfer(0xFF);
+      bbTransfer(0x4C); // CMD12: STOP_TRANSMISSION
+      bbTransfer(0x00);
+      bbTransfer(0x00);
+      bbTransfer(0x00);
+      bbTransfer(0x00);
+      bbTransfer(0x61);
+      for (int i = 0; i < 16; i++) bbTransfer(0xFF);
+      digitalWrite(csPin, HIGH);
+      for (int i = 0; i < 32; i++) bbTransfer(0xFF);
+    }
 
-  // 1. Flush hingga >512 byte (600x 0xFF) dengan CS HIGH untuk menyelesaikan
-  //    sisa transfer blok jika ESP32 baru saja di-reset di tengah pembacaan.
-  for (int i = 0; i < 600; i++) {
-    SPI.transfer(0xFF);
+    digitalWrite(csPin, HIGH);
+    for (int i = 0; i < 16; i++) bbTransfer(0xFF);
+
+    digitalWrite(csPin, LOW);
+    bbTransfer(0xFF);
+    for (int w = 0; w < 32; w++) {
+      if (bbTransfer(0xFF) == 0xFF) break;
+    }
+
+    bbTransfer(0x40); // CMD0: GO_IDLE_STATE
+    bbTransfer(0x00);
+    bbTransfer(0x00);
+    bbTransfer(0x00);
+    bbTransfer(0x00);
+    bbTransfer(0x95); // CRC7 untuk CMD0
+
+    for (int i = 0; i < 32; i++) {
+      uint8_t b = bbTransfer(0xFF);
+      if (b == 0x01) { r1 = 0x01; break; }
+      else if (b != 0xFF) { r1 = b; }
+    }
+
+    digitalWrite(csPin, HIGH);
+    bbTransfer(0xFF);
+    bbTransfer(0xFF);
+    if (r1 != 0x01) delay(15);
   }
-
-  for (int attempt = 0; attempt < 5 && r1 != 0x01; attempt++) {
-    digitalWrite(SD_CS, HIGH);
-    for (int i = 0; i < 32; i++) SPI.transfer(0xFF);
-
-    digitalWrite(SD_CS, LOW);
-    // Tunggu sampai jalur MISO lepas dari status sibuk (0x00 -> 0xFF)
-    for (int w = 0; w < 64; w++) {
-      if (SPI.transfer(0xFF) == 0xFF) break;
-    }
-
-    // Jika pada percobaan sebelumnya kartu masih di Transfer State, kirim CMD12 (STOP_TRANSMISSION)
-    if (attempt == 1) {
-      SPI.transfer(0x40 | 12);
-      SPI.transfer(0x00);
-      SPI.transfer(0x00);
-      SPI.transfer(0x00);
-      SPI.transfer(0x00);
-      SPI.transfer(0x61);
-      for (int i = 0; i < 32; i++) SPI.transfer(0xFF);
-      digitalWrite(SD_CS, HIGH);
-      for (int i = 0; i < 16; i++) SPI.transfer(0xFF);
-      digitalWrite(SD_CS, LOW);
-      for (int w = 0; w < 32; w++) {
-        if (SPI.transfer(0xFF) == 0xFF) break;
-      }
-    }
-
-    // Kirim CMD0 (GO_IDLE_STATE = 0x40 00 00 00 00 95)
-    SPI.transfer(0x40);
-    SPI.transfer(0x00);
-    SPI.transfer(0x00);
-    SPI.transfer(0x00);
-    SPI.transfer(0x00);
-    SPI.transfer(0x95);
-
-    // PENTING: Abaikan byte 0xFF dan 0x00 (busy); tunggu sampai byte R1 valid (0x01)
-    for (int i = 0; i < 64; i++) {
-      uint8_t b = SPI.transfer(0xFF);
-      if (b == 0x01) {
-        r1 = 0x01;
-        break;
-      } else if (b != 0xFF && b != 0x00 && (b & 0x80) == 0) {
-        r1 = b;
-      }
-    }
-
-    digitalWrite(SD_CS, HIGH);
-    SPI.transfer(0xFF);
-    delay(20);
-  }
-
-  SPI.endTransaction();
   return r1;
 }
 
 bool sdBegin()
 {
-  // PENTING: Jangan pernah memanggil SPI.end() atau pinMode() pada SCK/MOSI/MISO
-  // karena layar E-Paper sudah menggunakan bus SPI yang sama!
+  pinMode(EPD_CS, OUTPUT);
   digitalWrite(EPD_CS, HIGH);
   pinMode(SD_CS, OUTPUT);
   digitalWrite(SD_CS, HIGH);
+  delay(25);
 
-  gpio_pullup_en((gpio_num_t)SD_MISO);
-  gpio_pullup_en((gpio_num_t)SD_MOSI);
-  gpio_pullup_en((gpio_num_t)SD_CS);
-  delay(40);
-
-  // Coba mount hingga 4 kali dengan kecepatan konservatif (1 MHz -> 400 kHz)
-  // yang sangat stabil di kabel jumper breadboard paralel.
-  const uint32_t freqs[4] = { 1000000, 1000000, 400000, 400000 };
+  static const uint32_t freqs[4] = { 4000000, 1000000, 400000, 2000000 };
   for (int attempt = 0; attempt < 4 && !mounted; attempt++) {
-    uint8_t r1 = spiWakeSd();
-    Serial.printf("[SD] Percobaan #%d (Wake CMD0 = 0x%02X, SPI = %lu Hz)\n",
-                  attempt + 1, r1, (unsigned long)freqs[attempt]);
+    uint8_t r1 = bitBangWakeSd(SD_CS, SD_SCK, SD_MOSI, SD_MISO);
+    Serial.printf("[SD] Bit-Bang Wake #%d -> CMD0 R1 = 0x%02X\n", attempt + 1, r1);
+
+    // WAJIB: SPI.end() lalu SPI.begin() agar pin SCK/MISO/MOSI terpasang kembali ke hardware SPI
+    SPI.end();
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, -1);
+    gpio_pullup_en((gpio_num_t)SD_MISO);
+    gpio_pullup_en((gpio_num_t)SD_MOSI);
+    gpio_pullup_en((gpio_num_t)SD_CS);
+    delay(10);
+
     mounted = SD.begin(SD_CS, SPI, freqs[attempt]);
     if (!mounted || SD.cardType() == CARD_NONE) {
       mounted = false;
       SD.end();
-      gpio_pullup_en((gpio_num_t)SD_MISO);
-      delay(50);
+      delay(25);
     }
   }
 
+  // Pastikan bus SPI selalu ditinggalkan dalam keadaan aktif untuk layar E-Paper
   if (!mounted) {
+    SPI.end();
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, -1);
+    gpio_pullup_en((gpio_num_t)SD_MISO);
     trackCount = 0;
     Serial.println("[SD] Kartu MicroSD belum terdeteksi (mode lagu demo aktif).");
     return false;
@@ -762,11 +1006,17 @@ bool sdBegin()
   Serial.printf("[SD] Kartu MicroSD terhubung (%llu MB total, %llu MB terpakai).\n",
                 sdGetTotalMB(), sdGetUsedMB());
   sdScanLibrary();
+  releaseSdSpiBus();
   return true;
 }
 
 int sdScanLibrary()
 {
+  // Bersihkan pre-cache lama jika dipindai ulang
+  for (int i = 0; i < trackCount; i++) {
+    if (tracks[i].coverBmp) { free(tracks[i].coverBmp); tracks[i].coverBmp = nullptr; }
+    if (tracks[i].lrcText)  { free(tracks[i].lrcText);  tracks[i].lrcText  = nullptr; }
+  }
   trackCount = 0;
   if (!mounted) return 0;
 
@@ -777,16 +1027,38 @@ int sdScanLibrary()
 
   sortTracksByTitle();
 
+  // Pre-cache Cover Art 96x96 (1152 byte/lagu) & Lirik .lrc ke RAM saat bus SPI masih 100% bersih
+  // (sebelum layar E-Paper diinisialisasi), sehingga ganti lagu NEXT/PREV berlangsung instan (< 1 ms)!
+  for (int i = 0; i < trackCount; i++) {
+    if (ESP.getFreeHeap() > 50000) {
+      uint8_t *bmp = (uint8_t *)malloc(COVER_BYTES);
+      if (bmp) {
+        if (loadCoverFromDisk(tracks[i], bmp)) {
+          tracks[i].coverBmp = bmp;
+        } else {
+          free(bmp);
+        }
+      }
+    }
+    tracks[i].lrcText = loadLyricsTextFromDisk(tracks[i]);
+    if (tracks[i].lrcText) {
+      tracks[i].lrcLineCount = (uint16_t)lyricsLoadFromText(tracks[i].lrcText);
+    }
+  }
+  lyricsReset();
+
   Serial.printf("[SD] Ditemukan %d lagu MP3 di kartu MicroSD:\n", trackCount);
   for (int i = 0; i < trackCount; i++) {
-    Serial.printf("  %2d. %s — %s [%s] (%lus)%s\n",
+    Serial.printf("  %2d. %s — %s [%s] (%lus) [Cover: %s] [LRC: %u baris]\n",
                   i + 1,
                   tracks[i].title,
                   tracks[i].artist,
                   tracks[i].album,
                   (unsigned long)tracks[i].durationSec,
-                  tracks[i].apicOffset ? " [Cover: APIC]" : "");
+                  tracks[i].coverBmp ? "OK" : "Fallback",
+                  (unsigned)tracks[i].lrcLineCount);
   }
+  releaseSdSpiBus();
   return trackCount;
 }
 
@@ -820,78 +1092,37 @@ const SdTrackEntry &sdGetTrack(int index)
 bool sdLoadLyrics(const SdTrackEntry &track)
 {
   lyricsReset();
+  // 1. Ambil instan dari Pre-Cache RAM (0 ms SPI I/O, bebas konflik dengan layar E-Paper)
+  if (track.lrcText && track.lrcText[0]) {
+    int n = lyricsLoadFromText(track.lrcText);
+    return n > 0;
+  }
+
+  // 2. Fallback baca dari MicroSD jika lagu belum ter-cache
   if (!mounted || !track.path[0]) return false;
-
-  const char *exts[] = { ".lrc", ".LRC" };
-  char lrcPath[140];
-
-  // 1. Cek file .lrc dengan nama & folder yang sama dengan file .mp3
-  for (const char *ext : exts) {
-    replaceExtension(track.path, ext, lrcPath, sizeof(lrcPath));
-    if (SD.exists(lrcPath)) {
-      File f = SD.open(lrcPath, FILE_READ);
-      if (f) {
-        int n = lyricsLoadFromStream(f);
-        f.close();
-        Serial.printf("[SD] Lirik dimuat dari %s (%d baris)\n", lrcPath, n);
-        return n > 0;
-      }
-    }
-  }
-
-  // 2. Cek di folder "/lyrics/<nama_file>.lrc"
-  char baseLrc[96];
-  replaceExtension(baseNameOf(track.path), ".lrc", baseLrc, sizeof(baseLrc));
-  snprintf(lrcPath, sizeof(lrcPath), "/lyrics/%s", baseLrc);
-  if (SD.exists(lrcPath)) {
-    File f = SD.open(lrcPath, FILE_READ);
-    if (f) {
-      int n = lyricsLoadFromStream(f);
-      f.close();
-      Serial.printf("[SD] Lirik dimuat dari %s (%d baris)\n", lrcPath, n);
-      return n > 0;
-    }
-  }
-
-  return false;
+  char *txt = loadLyricsTextFromDisk(track);
+  releaseSdSpiBus();
+  if (!txt) return false;
+  int n = lyricsLoadFromText(txt);
+  free(txt);
+  return n > 0;
 }
 
 bool sdLoadCover(const SdTrackEntry &track, uint8_t *coverOut)
 {
-  if (!mounted || !track.path[0] || !coverOut) return false;
+  if (!coverOut) return false;
 
-  // 1. Cek file gambar "<nama_lagu>.jpg" atau "<nama_lagu>.jpeg" di sebelah file .mp3
-  const char *imgExts[] = { ".jpg", ".JPG", ".jpeg", ".JPEG" };
-  char imgPath[140];
-  for (const char *ext : imgExts) {
-    replaceExtension(track.path, ext, imgPath, sizeof(imgPath));
-    if (SD.exists(imgPath) && decodeJpegSliceToCover(imgPath, 0, 0, coverOut)) {
-      Serial.printf("[SD] Cover dimuat dari %s\n", imgPath);
-      return true;
-    }
+  // 1. Ambil instan dari Pre-Cache RAM (0 ms SPI I/O, bebas konflik dengan layar E-Paper)
+  if (track.coverBmp) {
+    memcpy(coverOut, track.coverBmp, COVER_BYTES);
+    return true;
   }
 
-  // 2. Cek gambar JPEG embedded (ID3v2 APIC) di dalam file .mp3 itu sendiri
-  if (track.apicOffset > 0 && track.apicSize > 64) {
-    if (decodeJpegSliceToCover(track.path, track.apicOffset, track.apicSize, coverOut)) {
-      Serial.printf("[SD] Cover dimuat dari tag ID3 APIC (%u byte)\n", (unsigned)track.apicSize);
-      return true;
-    }
-  }
-
-  // 3. Cek "cover.jpg" atau "folder.jpg" di folder tempat lagu berada
-  char dir[128];
-  parentDirOf(track.path, dir, sizeof(dir));
-  const char *folderCovers[] = { "cover.jpg", "Cover.jpg", "folder.jpg", "front.jpg" };
-  for (const char *fc : folderCovers) {
-    if (strcmp(dir, "/") == 0) snprintf(imgPath, sizeof(imgPath), "/%s", fc);
-    else snprintf(imgPath, sizeof(imgPath), "%s/%s", dir, fc);
-    if (SD.exists(imgPath) && decodeJpegSliceToCover(imgPath, 0, 0, coverOut)) {
-      Serial.printf("[SD] Cover dimuat dari %s\n", imgPath);
-      return true;
-    }
-  }
-
-  return false;
+  // 2. Fallback baca dari MicroSD jika lagu belum ter-cache
+  if (!mounted || !track.path[0]) return false;
+  bool ok = loadCoverFromDisk(track, coverOut);
+  releaseSdSpiBus();
+  return ok;
 }
+
 

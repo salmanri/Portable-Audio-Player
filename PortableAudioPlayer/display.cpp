@@ -449,6 +449,18 @@ static void drawLyrics(const char *text, bool hasLyrics)
   }
 }
 
+// Kembalikan jalur MOSI=HIGH & SCK=LOW setelah refresh E-Paper agar kartu MicroSD
+// di bus SPI bersama tidak terkunci apabila tombol Reset (EN) ditekan sewaktu-waktu.
+static void releaseSharedSpiBus()
+{
+  digitalWrite(EPD_CS, HIGH);
+  digitalWrite(SD_CS, HIGH);
+  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+  SPI.transfer(0xFF);
+  SPI.transfer(0xFF);
+  SPI.endTransaction();
+}
+
 static void refreshWindow(int x, int y, int w, int h)
 {
   digitalWrite(SD_CS, HIGH);
@@ -458,6 +470,7 @@ static void refreshWindow(int x, int y, int w, int h)
   } else {
     epd.displayWindow(x, y, w, h);
   }
+  releaseSharedSpiBus();
 }
 
 // ---------------------------------------------------------------------------
@@ -470,11 +483,12 @@ void displayBegin()
   pinMode(SD_CS, OUTPUT);
   digitalWrite(SD_CS, HIGH);
 
-  SPI.end();
+  // Jangan panggil SPI.end() di sini agar mount MicroSD yang sudah aktif tidak terputus
   SPI.begin(EPD_SCK, SD_MISO, EPD_MOSI, -1);
   epd.epd2.selectSPI(SPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
 
-  epd.init(115200, true, 2, false);
+  // initial=false agar displaySplash() tidak melakukan _Update_Full dua kali berturut-turut
+  epd.init(115200, false, 2, false);
   epd.setRotation(1);  // landscape 296x128
   epd.setTextWrap(false);
 
@@ -497,7 +511,9 @@ void displaySplash()
   drawCenter(cx, 100, "Hi-Fi Digital Audio  \xC2\xB7  E-Paper Display", F_SMALL);
   drawCenter(cx, 121, "Firmware " FW_VERSION, F_SMALL);
 
+  digitalWrite(SD_CS, HIGH);
   epd.display(false);
+  releaseSharedSpiBus();
   partialCount = 0;
 }
 
@@ -513,8 +529,10 @@ void displayNowPlaying(const StatusInfo &st, const TrackView &t,
   drawLyrics(lyric, hasLyrics);
   drawTransport(t);
 
+  digitalWrite(SD_CS, HIGH);
   if (fullRefresh) {
     epd.display(false);
+    releaseSharedSpiBus();
     partialCount = 0;
   } else {
     refreshWindow(0, 0, SCREEN_W, SCREEN_H);
@@ -630,6 +648,7 @@ void displayMenu(const char *title, const StatusInfo &st,
   digitalWrite(SD_CS, HIGH);
   if (fullRefresh) {
     epd.display(false);
+    releaseSharedSpiBus();
     partialCount = 0;
   } else {
     refreshWindow(0, 0, SCREEN_W, SCREEN_H);   // partial cepat tanpa kedip (~280 ms)

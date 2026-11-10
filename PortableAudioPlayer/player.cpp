@@ -205,7 +205,12 @@ static void selectTrack(int index, bool autoPlay)
     const SdTrackEntry &sd = sdGetTrack(index);
     uint8_t tempCover[COVER_BYTES];
     bool gotCover = sdLoadCover(sd, tempCover);
-    sdLoadLyrics(sd);
+    if (!gotCover) {
+      // Fallback ke seni vektor Walkman retro jika lagu MP3 tidak memiliki gambar sampul
+      generateDemoCover(index % 5, tempCover);
+      gotCover = true;
+    }
+    bool gotLyrics = sdLoadLyrics(sd);
 
     lockPlayer();
     state.active = true;
@@ -217,13 +222,14 @@ static void selectTrack(int index, bool autoPlay)
     state.durationMs = max((uint32_t)1, sd.durationSec) * 1000UL;
     state.positionMs = 0;
     state.hasCover = gotCover;
-    if (gotCover) memcpy(currentCover, tempCover, COVER_BYTES);
+    memcpy(currentCover, tempCover, COVER_BYTES);
     state.trackVersion++;
     lastTickMillis = millis();
     unlockPlayer();
 
-    Serial.printf("[Player] SD Track [%d/%d]: %s - %s (%lus)\n",
-                  index + 1, total, sd.title, sd.artist, (unsigned long)sd.durationSec);
+    Serial.printf("[Player] SD Track [%d/%d]: %s - %s (%lus) [Cover:%s, LRC:%d baris]\n",
+                  index + 1, total, sd.title, sd.artist, (unsigned long)sd.durationSec,
+                  sd.coverBmp ? "JPEG" : "Retro", gotLyrics ? lyricsGetLineCount() : 0);
   } else {
     const TrackMetadata &m = DEMO_TRACKS[index];
     lockPlayer();

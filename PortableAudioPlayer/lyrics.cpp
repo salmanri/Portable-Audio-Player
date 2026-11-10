@@ -183,6 +183,43 @@ int lyricsLoadFromText(const char *lrcText)
     parseLrcLine(line);
   }
 
+  // Fallback jika lirik berupa teks biasa tanpa timestamp [mm:ss.xx] (mis. tag ID3 USLT polos):
+  // bagi per baris dengan interval 4 detik agar tetap tampil di layar Now Playing.
+  if (stagingCount == 0) {
+    p = lrcText;
+    li = 0;
+    uint32_t synthTimeMs = 0;
+    auto pushPlainLine = [&](char *ln) {
+      while (*ln == ' ' || *ln == '\t') ln++;
+      int len = strlen(ln);
+      while (len > 0 && (ln[len - 1] == ' ' || ln[len - 1] == '\r' || ln[len - 1] == '\n')) {
+        ln[--len] = '\0';
+      }
+      if (len == 0 || ln[0] == '[') return;
+      normalizeText(ln);
+      if (stagingCount < MAX_LYRIC_LINES) {
+        lines[stagingCount].time_ms = synthTimeMs;
+        strlcpy(lines[stagingCount].text, ln, LYRIC_TEXT_LEN);
+        stagingCount++;
+        synthTimeMs += 4000;
+      }
+    };
+    while (*p && stagingCount < MAX_LYRIC_LINES) {
+      char c = *p++;
+      if (c == '\n') {
+        line[li] = '\0';
+        pushPlainLine(line);
+        li = 0;
+      } else if (c != '\r') {
+        if (li < (int)sizeof(line) - 1) line[li++] = c;
+      }
+    }
+    if (li > 0 && stagingCount < MAX_LYRIC_LINES) {
+      line[li] = '\0';
+      pushPlainLine(line);
+    }
+  }
+
   return publishStaging();
 }
 
@@ -248,6 +285,15 @@ void lyricsGetCurrent(uint32_t positionMs, int leadMs, char *out, size_t outLen)
         show = false;
       }
       if (show) strlcpy(out, lines[idx].text, outLen);
+    } else {
+      // Saat intro sebelum timestamp pertama (mis. [00:13.80] di Leave The Door Open),
+      // tampilkan langsung baris lirik pembuka agar area lirik tidak kosong di awal lagu.
+      for (int k = 0; k < n; k++) {
+        if (lines[k].text[0] != '\0') {
+          strlcpy(out, lines[k].text, outLen);
+          break;
+        }
+      }
     }
   }
   xSemaphoreGive(lyrMutex);

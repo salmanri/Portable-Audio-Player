@@ -39,14 +39,13 @@ void setup()
   // Matikan radio Wi-Fi di mode offline untuk menghemat daya & suhu LDO
   WiFi.mode(WIFI_OFF);
 
-  // 1. Siapkan bus VSPI & pin CS (belum mengirim gambar ke layar)
-  displayBegin();
-
-  // 2. Mount MicroSD saat bus SPI masih tenang (sebelum trafik gambar splash screen)
+  // 1. Inisialisasi MicroSD terlebih dahulu (persis seperti saat berhasil membaca 3 lagu)
   playerBegin();
 
-  // 3. Tampilkan splash screen lalu masuk ke UI utama
+  // 2. Inisialisasi layar E-Paper & tampilkan splash screen
+  displayBegin();
   displaySplash();
+
   inputBegin();
   uiBegin();
 }
