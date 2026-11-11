@@ -65,6 +65,6 @@ void loop()
   // 3. Render perubahan ke layar E-Paper
   uiTick();
 
-  delay(15);
+  delay(2);
 }
 

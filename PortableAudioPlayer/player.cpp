@@ -6,6 +6,7 @@
 #include "pins.h"
 #include "lyrics.h"
 #include "sdcard.h"
+#include "Audio.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <math.h>
@@ -78,6 +79,32 @@ static PlayerState state = {};
 static uint8_t currentCover[COVER_BYTES];
 static unsigned long lastTickMillis = 0;
 static bool usingSdLibrary = false;
+
+// ---------------------------------------------------------------------------
+// Engine Audio I2S (Fase 4: PCM5102A & MAX98357A)
+// ---------------------------------------------------------------------------
+static Audio audio;
+static volatile bool eofPending = false;
+static uint32_t lastAudioSec = 0;
+static unsigned long audioSecTickMillis = 0;
+
+// Debounce ganti lagu: file MP3 baru dibuka setelah tombol tidak ditekan selama X ms
+constexpr unsigned long TRACK_SWITCH_DEBOUNCE_MS = 350;
+static int pendingAudioIdx = -1;
+static bool pendingAutoPlay = true;
+static unsigned long pendingAtMillis = 0;
+
+static void audioInfoCb(Audio::msg_t msg)
+{
+  if (msg.e == Audio::evt_eof) {
+    eofPending = true;
+    Serial.println("[Audio] Event: EOF (Selesai memutar lagu)");
+  } else if (msg.msg && strlen(msg.msg) > 0) {
+    if (msg.e == Audio::evt_info || msg.e == Audio::evt_bitrate) {
+      Serial.printf("[Audio] %s: %s\n", Audio::eventStr[msg.e], msg.msg);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Generator Cover Art 96x96 1-Bit (5 Gaya Retro Berbeda untuk Lagu Demo)
@@ -202,6 +229,11 @@ static void selectTrack(int index, bool autoPlay)
   if (index >= total) index = 0;
 
   if (usingSdLibrary) {
+    // 1. Hentikan pemutaran lagu sebelumnya & tutup file dengan bersih
+    audio.stopSong();
+    eofPending = false;
+
+    // 2. Muat cover art dan lirik dari RAM pre-cache atau MicroSD
     const SdTrackEntry &sd = sdGetTrack(index);
     uint8_t tempCover[COVER_BYTES];
     bool gotCover = sdLoadCover(sd, tempCover);
@@ -211,6 +243,16 @@ static void selectTrack(int index, bool autoPlay)
       gotCover = true;
     }
     bool gotLyrics = sdLoadLyrics(sd);
+
+    // 3. Jadwalkan pembukaan file MP3 (debounce). Jika tombol NEXT/PREV ditekan
+    //    beruntun, hanya lagu terakhir yang benar-benar dibuka di MicroSD.
+    pendingAudioIdx = index;
+    pendingAutoPlay = autoPlay;
+    pendingAtMillis = millis();
+    const bool opened = true; // status sebenarnya dilaporkan saat file dibuka
+
+    lastAudioSec = 0;
+    audioSecTickMillis = millis();
 
     lockPlayer();
     state.active = true;
@@ -227,9 +269,10 @@ static void selectTrack(int index, bool autoPlay)
     lastTickMillis = millis();
     unlockPlayer();
 
-    Serial.printf("[Player] SD Track [%d/%d]: %s - %s (%lus) [Cover:%s, LRC:%d baris]\n",
+    Serial.printf("[Player] SD Track [%d/%d]: %s - %s (%lus) [Cover:%s, LRC:%d baris, Audio:%s]\n",
                   index + 1, total, sd.title, sd.artist, (unsigned long)sd.durationSec,
-                  sd.coverBmp ? "JPEG" : "Retro", gotLyrics ? lyricsGetLineCount() : 0);
+                  sd.coverBmp ? "JPEG" : "Retro", gotLyrics ? lyricsGetLineCount() : 0,
+                  opened ? "OK" : "ERR");
   } else {
     const TrackMetadata &m = DEMO_TRACKS[index];
     lockPlayer();
@@ -261,6 +304,13 @@ void playerBegin()
   pinMode(AMP_SD, OUTPUT);
   digitalWrite(AMP_SD, LOW);
 
+  // Inisialisasi Audio I2S
+  Audio::audio_info_callback = audioInfoCb;
+  audio.setPinout(I2S_BCLK, I2S_LRCK, I2S_DOUT);
+  audio.setVolumeSteps(100);
+  audio.setVolume(VOLUME_DEFAULT);
+  audio.setAudioTaskCore(0); // Audio decoding & I2S DMA berjalan di Core 0
+
   // Fase 3: Inisialisasi MicroSD & pindai lagu .mp3
   sdBegin();
   usingSdLibrary = (sdGetTrackCount() > 0);
@@ -276,27 +326,95 @@ void playerBegin()
 
 void playerTick()
 {
-  bool needNext = false;
+  if (usingSdLibrary) {
+    // 0. Buka file MP3 yang tertunda setelah tombol NEXT/PREV berhenti ditekan
+    if (pendingAudioIdx >= 0 && (millis() - pendingAtMillis) >= TRACK_SWITCH_DEBOUNCE_MS) {
+      const int idx = pendingAudioIdx;
+      const bool ap = pendingAutoPlay;
+      pendingAudioIdx = -1;
 
-  lockPlayer();
-  unsigned long now = millis();
-  unsigned long dt = now - lastTickMillis;
-  lastTickMillis = now;
+      const SdTrackEntry &sd = sdGetTrack(idx);
+      unsigned long t0 = millis();
+      bool opened = audio.connecttoFS(SD, sd.path);
+      if (opened && !ap) audio.pauseResume();
+      eofPending = false;
+      lastAudioSec = 0;
+      audioSecTickMillis = millis();
 
-  if (state.active && state.playing) {
-    state.positionMs += (uint32_t)dt;
-    if (state.durationMs > 0 && state.positionMs >= state.durationMs) {
-      if (state.playMode == PLAY_REPEAT_ONE) {
-        state.positionMs = 0;
+      lockPlayer();
+      state.playing = opened && ap;
+      unlockPlayer();
+
+      Serial.printf("[Audio] Buka %s -> %s (%lu ms)\n", sd.path, opened ? "OK" : "GAGAL",
+                    (unsigned long)(millis() - t0));
+    }
+
+    // 1. Beri makan buffer audio dari SD card
+    audio.loop();
+
+    // 2. Cek apakah lagu selesai (EOF)
+    if (eofPending) {
+      eofPending = false;
+      lockPlayer();
+      PlayMode pm = state.playMode;
+      int curIdx = state.trackIndex;
+      unlockPlayer();
+
+      if (pm == PLAY_REPEAT_ONE) {
+        selectTrack(curIdx, true);
       } else {
-        needNext = true;
+        playerNext();
+      }
+      return;
+    }
+
+    // 3. Sinkronisasi posisi playhead & durasi dengan realitas audio hardware
+    uint32_t currentSec = audio.getAudioCurrentTime();
+    uint32_t fileDur = audio.getAudioFileDuration();
+
+    lockPlayer();
+    if (fileDur > 0 && pendingAudioIdx < 0) {
+      state.durationMs = fileDur * 1000UL;
+    }
+
+    if (currentSec != lastAudioSec) {
+      lastAudioSec = currentSec;
+      audioSecTickMillis = millis();
+    }
+
+    uint32_t subSecMs = 0;
+    if (state.playing && pendingAudioIdx < 0 && audio.isRunning()) {
+      subSecMs = millis() - audioSecTickMillis;
+      if (subSecMs > 999) subSecMs = 999;
+    }
+    state.positionMs = (currentSec * 1000UL) + subSecMs;
+    if (state.durationMs > 0 && state.positionMs > state.durationMs) {
+      state.positionMs = state.durationMs;
+    }
+    unlockPlayer();
+  } else {
+    bool needNext = false;
+
+    lockPlayer();
+    unsigned long now = millis();
+    unsigned long dt = now - lastTickMillis;
+    lastTickMillis = now;
+
+    if (state.active && state.playing) {
+      state.positionMs += (uint32_t)dt;
+      if (state.durationMs > 0 && state.positionMs >= state.durationMs) {
+        if (state.playMode == PLAY_REPEAT_ONE) {
+          state.positionMs = 0;
+        } else {
+          needNext = true;
+        }
       }
     }
-  }
-  unlockPlayer();
+    unlockPlayer();
 
-  if (needNext) {
-    playerNext();
+    if (needNext) {
+      playerNext();
+    }
   }
 }
 
@@ -307,13 +425,34 @@ void playerPlayTrack(int index)
 
 void playerTogglePause()
 {
-  lockPlayer();
-  state.playing = !state.playing;
-  lastTickMillis = millis();
-  bool pl = state.playing;
-  unlockPlayer();
+  if (usingSdLibrary) {
+    if (pendingAudioIdx >= 0) {
+      // File belum dibuka (masih dalam jeda debounce) -> cukup ubah niat autoplay
+      pendingAutoPlay = !pendingAutoPlay;
+      lockPlayer();
+      state.playing = pendingAutoPlay;
+      unlockPlayer();
+      Serial.printf("[Player] %s\n", pendingAutoPlay ? "PLAY" : "PAUSE");
+      return;
+    }
+    audio.pauseResume();
+    lockPlayer();
+    state.playing = audio.isRunning();
+    lastTickMillis = millis();
+    audioSecTickMillis = millis();
+    bool pl = state.playing;
+    unlockPlayer();
 
-  Serial.printf("[Player] %s\n", pl ? "PLAY" : "PAUSE");
+    Serial.printf("[Player] %s\n", pl ? "PLAY" : "PAUSE");
+  } else {
+    lockPlayer();
+    state.playing = !state.playing;
+    lastTickMillis = millis();
+    bool pl = state.playing;
+    unlockPlayer();
+
+    Serial.printf("[Player] %s\n", pl ? "PLAY" : "PAUSE");
+  }
 }
 
 void playerNext()
@@ -342,6 +481,12 @@ void playerPrev()
     state.positionMs = 0;
     lastTickMillis = millis();
     unlockPlayer();
+
+    if (usingSdLibrary) {
+      audio.setAudioPlayTime(0);
+      lastAudioSec = 0;
+      audioSecTickMillis = millis();
+    }
     Serial.println("[Player] Prev -> Ulang dari 0:00");
     return;
   }
@@ -364,6 +509,13 @@ void playerSeekRelativeMs(int32_t deltaMs)
   uint32_t pos = state.positionMs;
   unlockPlayer();
 
+  if (usingSdLibrary) {
+    uint32_t targetSec = pos / 1000UL;
+    audio.setAudioPlayTime(targetSec);
+    lastAudioSec = targetSec;
+    audioSecTickMillis = millis();
+  }
+
   Serial.printf("[Player] Seek -> %lu.%lus\n", (unsigned long)(pos / 1000),
                 (unsigned long)((pos % 1000) / 100));
 }
@@ -374,6 +526,10 @@ void playerChangeVolume(int delta)
   state.volume = constrain(state.volume + delta, 0, 100);
   int v = state.volume;
   unlockPlayer();
+
+  if (usingSdLibrary) {
+    audio.setVolume(v);
+  }
 
   Serial.printf("[Player] Volume: %d%%\n", v);
 }
